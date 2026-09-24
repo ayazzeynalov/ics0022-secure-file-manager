@@ -1,48 +1,33 @@
-# Prerequisites
-*.d
-
-# Object files
+# Build outputs
+securefm
+build/
 *.o
-*.ko
-*.obj
-*.elf
-
-# Linker output
-*.ilk
-*.map
-*.exp
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Libraries
-*.lib
+*.d
 *.a
-*.la
-*.lo
-
-# Shared objects (inc. Windows DLLs)
-*.dll
 *.so
 *.so.*
 *.dylib
-
-# Executables
+*.dll
 *.exe
 *.out
 *.app
-*.i*86
-*.x86_64
-*.hex
-
-# Debug files
 *.dSYM/
 *.su
 *.idb
 *.pdb
+*.dwo
 
-# Kernel Module Compile Results
+# Temporary/compiler files
+*.gch
+*.pch
+*.ilk
+*.map
+*.exp
+*.la
+*.lo
+*.ko
+*.obj
+*.elf
 *.mod*
 *.cmd
 .tmp_versions/
@@ -51,5 +36,12 @@ Module.symvers
 Mkfile.old
 dkms.conf
 
-# debug information files
-*.dwo
+# Local runtime/test data
+.securefm/
+*.sfm
+*.enc
+
+# macOS/editor noise
+.DS_Store
+*.swp
+*~
