@@ -372,7 +372,6 @@ OpenSSL provides established implementations for CSPRNG, scrypt, HKDF, HMAC, con
 ```text
 .
 ├── README.md
-├── Checkpoint_1.md
 ├── Makefile
 ├── .gitignore
 ├── include/
