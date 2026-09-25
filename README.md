@@ -105,12 +105,6 @@ make
 ./securepm --help
 ```
 
-Debug build:
-
-```bash
-make debug
-```
-
 Clean build files:
 
 ```bash
