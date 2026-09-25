@@ -1,29 +1,12 @@
-# Build outputs
+# Build files
 securepm
-build/
-*.o
-*.d
-*.a
-*.so
-*.so.*
-*.dylib
-*.dll
-*.exe
-*.out
-*.app
+src/*.o
 *.dSYM/
 
-# Local password-manager data
+# Local vault data
 .securepm/
 *.vault
 *.tmp
 
-# Test / sanitizer artifacts
-coverage/
-*.profraw
-*.profdata
-
-# macOS / editor noise
+# macOS
 .DS_Store
-*.swp
-*~
