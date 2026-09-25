@@ -11,28 +11,37 @@
 
 The project is a local command-line password manager. Each application user has an encrypted vault containing credential records. A master password is used to authenticate the user and unlock the vault. Stored passwords are never written to disk in plaintext and are never printed in cleartext by the interface.
 
-Checkpoint 1 is a design checkpoint. The repository contains the planned architecture, threat model, cryptographic and vault-format decisions, a Makefile, and a small buildable CLI skeleton. Authentication, encryption, and vault operations are intentionally left for Checkpoint 2.
+Checkpoint 1 is a design checkpoint. The repository contains the planned architecture, threat model, cryptographic and vault-format decisions, a Makefile, and a small buildable CLI skeleton. Authentication, encryption, and vault operations are intentionally left for later checkpoints.
 
-### In scope
+### Required project scope
 
-- master-password authentication;
-- encrypted credential storage;
-- add, list, retrieve, update, and delete credential records;
+The following items come directly from the Project 2 specification:
+
+- secure storage of credentials using strong encryption;
+- add, retrieve, update, and delete stored credentials;
+- master-password authentication, with the master password never stored in plaintext;
+- secure memory handling for sensitive data;
+- input validation and sanitization;
+- a simple command-line or minimal graphical interface that never displays passwords in cleartext;
 - per-user ownership on every record operation;
-- secure memory handling for passwords and keys;
-- strict input and length validation;
-- safe local file handling;
-- structured audit logging without secrets;
-- generic user-facing security errors.
+- secure error handling and structured logging that never contains secrets.
 
-### Out of scope
+### Design choices for this implementation
 
-- network access, remote synchronization, or a web service;
-- browser extensions;
-- password sharing between users;
-- recovery of a forgotten master password;
-- protection from a compromised OS kernel, root/administrator, or a debugger with permission to read this process;
-- guaranteed physical erasure from SSD snapshots, backups, or copy-on-write storage.
+The following are implementation decisions for this project, not extra course requirements:
+
+- use a local interactive CLI rather than a GUI;
+- keep one encrypted vault per application user;
+- do not add networking, remote synchronization, browser extensions, or password sharing;
+- do not implement forgotten-master-password recovery in the initial version.
+
+### Assumptions and limitations
+
+These are security-boundary assumptions, not requirements from the lecturer:
+
+- a compromised OS kernel, root/administrator, or an authorized debugger can read live process memory;
+- weak master passwords remain vulnerable to guessing even when a memory-hard KDF is used;
+- physical erasure from SSD snapshots, backups, or copy-on-write storage cannot be guaranteed by this application.
 
 ## 2. Security objectives and assets
 
@@ -306,23 +315,24 @@ securepm> exit
 - Rollback to an older but otherwise valid encrypted vault is not fully prevented by the initial design.
 - Physical erasure from SSD snapshots/backups is outside the application's guarantees.
 
-## 10. Secure coding rules used by this project
+## 10. Course-material traceability and secure coding rules
 
-The implementation will follow the concepts covered in the course materials:
+This section records how the design relates to material actually covered in the course. It is not a list of additional checkpoint requirements.
 
-- **Week 1 — secure SDLC:** security requirements and threat modelling are done before implementing the crypto/storage code; later checkpoints add security testing and code review.
-- **Week 1 — authentication vs authorization:** login verifies identity; every record operation separately checks ownership.
-- **Week 1 — CIA / fail securely / defense in depth:** encryption, integrity checking, access control, filesystem permissions, validation, and testing are separate layers.
-- **Week 2 — economy of mechanism:** local CLI, one crypto library, one encrypted vault per user; no network service or unnecessary framework.
-- **Week 2 — fail-safe defaults:** deny access and reject data whenever authentication, parsing, RNG, integrity, or I/O validation fails.
-- **Week 2 — complete mediation:** authorization is checked on every protected record operation.
-- **Week 2 — least privilege:** private `0700/0600` storage and no unnecessary elevated privileges.
-- **Week 2 — threat modelling / misuse cases:** assets and attack scenarios are converted into mitigations and later negative tests.
-- **Week 3 — secure file I/O:** internal paths are application controlled; symlink, traversal, race, temporary-file, and TOCTOU behavior are considered explicitly.
-- **Week 4 — strings and input validation:** explicit size limits, checked arithmetic, correct null termination, and boundary testing prevent common C string mistakes.
-- **Week 4 — format strings:** user-controlled strings are always passed as data, e.g. `printf("%s", value)`, never as the format string itself.
+- **Week 1 — core security concepts:** confidentiality, integrity, availability, authentication, and authorization are explicitly introduced. In this project they map to encrypted credentials, tamper detection, controlled failure, master-password login, and per-user record checks.
+- **Week 1 — Secure SDLC:** the slides explicitly place security requirements and threat modelling before implementation, followed by security testing and code review. This is why Checkpoint 1 focuses on architecture/threats before the cryptographic implementation.
+- **Week 1 — secure programming principles:** least privilege, defense in depth, fail securely, and keeping the design simple are explicitly covered. The project uses private file permissions, multiple independent controls, fail-closed error paths, and a deliberately small local CLI.
+- **Week 1 — boundary input rules:** the slides explicitly recommend validating type/length/range/format, allow-listing valid input, checking arithmetic before allocation, and avoiding unsafe format-string use.
+- **Week 2 — economy of mechanism:** the course explicitly recommends keeping protection mechanisms small and simple because complexity increases implementation/configuration errors.
+- **Week 2 — fail-safe defaults:** access is denied by default and only granted when required conditions are satisfied.
+- **Week 2 — complete mediation:** the course explicitly states that access to every protected object must be checked for authority; this maps directly to checking ownership on every record operation.
+- **Week 2 — least privilege:** components should operate with only the privileges they need; this maps to private `0700/0600` storage and no elevated privileges.
+- **Week 2 — threat modelling and misuse cases:** the course requires identifying assets, creating an architecture overview, decomposing the application, identifying/documenting/rating threats, and developing mitigations. The supplied misuse-case reading also recommends looking at scenarios from an attacker point of view and turning failure modes into tests.
+- **Week 3 — secure file I/O:** the material explicitly covers directory traversal, alternate/equivalent paths, symlink/hard-link risks, race conditions, TOCTOU, temporary files, and file permissions. These concerns inform the application-controlled internal filenames, private storage, descriptor-based checks, and atomic updates.
+- **Week 4 — strings and input validation:** the material explicitly covers unbounded copies, off-by-one errors, missing null termination, truncation, and `sprintf`-style buffer risks. The implementation therefore uses explicit size limits, checked arithmetic, bounded reads, and careful termination handling.
+- **Format strings:** unsafe format-string use is explicitly mentioned in the Week 1 secure-coding slides and in the supplied penetration-testing reading. The course roadmap schedules the dedicated formatted-output/format-string topic later, so this document does not present it as a Week 4 topic.
 
-Examples of functions/patterns to avoid with untrusted data include unbounded `strcpy`, `strcat`, `sprintf`, `gets`, and `printf(variable)`. Bounded operations are still checked for truncation and null-termination edge cases rather than assumed safe automatically.
+Examples of functions/patterns to avoid with untrusted data include unbounded `strcpy`, `strcat`, `sprintf`, `gets`, and `printf(variable)`. Bounded functions are still checked for truncation and null-termination edge cases rather than assumed safe automatically.
 
 ## 11. Logging and error handling
 
@@ -412,33 +422,46 @@ The Makefile enables strict warnings. The debug target enables AddressSanitizer 
 
 ## 14. Checkpoint roadmap
 
-### Checkpoint 1 — current
+The items below first reproduce the official Password Manager checkpoint requirements. Extra implementation/testing goals are labelled separately.
 
-- architecture and data flow;
-- master-password/key hierarchy;
-- vault format and cryptographic scheme;
-- threat model covering master password, vault at rest, vault in memory, and interface;
-- README and initialized buildable repository.
+### Checkpoint 1 — official requirements
 
-### Checkpoint 2
+- short design document plus an initialized repository;
+- architecture showing the encryption module, user-management module, storage layer, and data flow;
+- threat model covering the master password, vault at rest, vault in memory, and interface, with a mitigation for each listed threat;
+- initial vault-format and cryptographic-scheme decision;
+- README stating scope, planned commands/screens, and build/run instructions.
 
-- create-user/login and master-password verification;
-- basic encrypted vault storage;
-- add/list/show/copy/update/delete operations;
-- credentials encrypted at rest;
-- interface never prints stored passwords in cleartext;
-- clean-machine build/run instructions and incremental commits.
+### Checkpoint 2 — official requirements
 
-### Checkpoint 3
+- working code that a reviewer can build and run, plus a short progress note;
+- basic vault storage working;
+- simple credentials encrypted at rest using the chosen scheme;
+- master-password authentication implemented, with the vault unlocking only after successful verification;
+- usable interface that never prints passwords in cleartext;
+- build/run instructions that work on a clean machine and commit history showing incremental progress.
 
-- secure-memory handling audit;
-- full validation/sanitization on all fields;
-- structured logging and secure generic errors;
-- ownership enforcement on every record operation;
-- unit/integration/negative tests;
-- malformed-vault and boundary tests;
-- ASan/UBSan and static-analysis review;
-- draft final report.
+The overall Project 2 requirements also require add, retrieve, update, and delete operations, so I plan to implement those during the Checkpoint 2 development phase where practical; they are not listed as separate Checkpoint 2 grading bullets.
+
+### Checkpoint 3 — official requirements
+
+- feature-complete code, a test suite, and a draft report;
+- secure memory handling completed;
+- full input validation and sanitization on all fields;
+- structured logging of key events and secure error handling;
+- per-user access control enforced on every record operation;
+- passing tests including input-validation edge cases and memory-handling checks;
+- draft report covering Introduction, Implementation, Security Analysis, and Conclusion.
+
+### Additional verification planned before the final presentation
+
+The following are my own engineering/testing goals rather than separate Checkpoint 3 rubric items:
+
+- malformed/truncated-vault and serialization-boundary tests;
+- AddressSanitizer and UndefinedBehaviorSanitizer runs;
+- static-analysis review;
+- symlink/TOCTOU/path-manipulation negative tests;
+- tamper, nonce, logging, and cross-user adversarial tests.
 
 ## 15. Adversarial demonstration checklist
 
