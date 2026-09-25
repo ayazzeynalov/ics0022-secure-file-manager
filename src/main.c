@@ -1,51 +1,55 @@
 #include <stdio.h>
 #include <string.h>
 
-#define SECUREFM_VERSION "0.1.0-checkpoint1"
+#define SECUREPM_VERSION "0.1.0-checkpoint1"
 
 static void print_usage(FILE *stream, const char *program)
 {
     fprintf(stream,
-            "Secure File Manager (%s)\n"
+            "Secure Password Manager (%s)\n"
             "ICS0022 Secure Programming project\n\n"
             "Usage:\n"
-            "  %s init\n"
-            "  %s create-user <username>\n"
-            "  %s encrypt <username> <source-path> <alias>\n"
-            "  %s decrypt <username> <alias> <output-path>\n"
-            "  %s list <username>\n"
-            "  %s delete <username> <alias>\n"
+            "  %s\n"
             "  %s --help\n\n"
+            "Planned interactive flow:\n"
+            "  1. Create user\n"
+            "  2. Login\n"
+            "  3. Exit\n\n"
+            "After login, planned commands are:\n"
+            "  add\n"
+            "  list\n"
+            "  show <record-id>\n"
+            "  copy <record-id>\n"
+            "  update <record-id>\n"
+            "  delete <record-id>\n"
+            "  lock\n"
+            "  help\n"
+            "  exit\n\n"
             "Checkpoint 1 status:\n"
-            "  The command interface is defined, but authentication, encryption,\n"
-            "  storage, and deletion are intentionally not implemented yet.\n"
-            "  See docs/checkpoint1-design.md for the security architecture.\n",
-            SECUREFM_VERSION,
-            program,
-            program,
-            program,
-            program,
-            program,
+            "  Architecture, threat model, vault format, and command interface\n"
+            "  are defined. Authentication and encrypted vault functionality\n"
+            "  are intentionally planned for Checkpoint 2.\n",
+            SECUREPM_VERSION,
             program,
             program);
 }
 
 int main(int argc, char *argv[])
 {
+    if (argc == 1) {
+        print_usage(stdout, argv[0]);
+        return 0;
+    }
+
     if (argc == 2 &&
         (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
         print_usage(stdout, argv[0]);
         return 0;
     }
 
-    if (argc == 1) {
-        print_usage(stdout, argv[0]);
-        return 0;
-    }
-
     fprintf(stderr,
-            "securefm: command not implemented in Checkpoint 1.\n"
-            "Run '%s --help' to see the planned interface.\n",
+            "securepm: Checkpoint 1 contains only the CLI skeleton.\n"
+            "Run '%s --help' to view the planned interface.\n",
             argv[0]);
     return 2;
 }
