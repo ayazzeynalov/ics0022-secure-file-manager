@@ -1,5 +1,5 @@
 # Build outputs
-securefm
+securepm
 build/
 *.o
 *.d
@@ -12,36 +12,18 @@ build/
 *.out
 *.app
 *.dSYM/
-*.su
-*.idb
-*.pdb
-*.dwo
 
-# Temporary/compiler files
-*.gch
-*.pch
-*.ilk
-*.map
-*.exp
-*.la
-*.lo
-*.ko
-*.obj
-*.elf
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
+# Local password-manager data
+.securepm/
+*.vault
+*.tmp
 
-# Local runtime/test data
-.securefm/
-*.sfm
-*.enc
+# Test / sanitizer artifacts
+coverage/
+*.profraw
+*.profdata
 
-# macOS/editor noise
+# macOS / editor noise
 .DS_Store
 *.swp
 *~
