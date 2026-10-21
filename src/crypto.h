@@ -6,6 +6,8 @@
 
 #define CRYPTO_KEY_BYTES 32
 #define CRYPTO_SALT_BYTES 16
+#define CRYPTO_GCM_NONCE_BYTES 12
+#define CRYPTO_GCM_TAG_BYTES 16
 #define CRYPTO_PASSWORD_MAX_BYTES 1024
 #define CRYPTO_SCRYPT_MAX_MEMORY (UINT64_C(64) * 1024 * 1024)
 #define CRYPTO_AUTH_CONTEXT "securepm:v1:auth"
@@ -52,5 +54,27 @@ int crypto_hkdf_sha256(const unsigned char *key, size_t key_length,
  * their terminating NUL. Both keys are published together only on success. */
 int crypto_derive_keys(const unsigned char *root, size_t root_length,
                        struct crypto_keys *keys);
+
+/* AES-256-GCM uses a fresh random nonce for every encryption. AAD is optional:
+ * NULL is accepted only when aad_length is zero. Plaintext may be empty, in
+ * which case plaintext and ciphertext may be NULL with zero capacity. All
+ * other buffers must be distinct. Length outputs are set to zero on failure. */
+int crypto_aes256_gcm_encrypt(const unsigned char *key, size_t key_length,
+                              const unsigned char *plaintext, size_t plaintext_length,
+                              const unsigned char *aad, size_t aad_length,
+                              unsigned char *ciphertext, size_t ciphertext_capacity,
+                              size_t *ciphertext_length,
+                              unsigned char *nonce, size_t nonce_capacity,
+                              unsigned char *tag, size_t tag_capacity);
+
+/* Plaintext is copied to the caller only after authentication succeeds. On
+ * authentication or other failure, plaintext is left untouched. */
+int crypto_aes256_gcm_decrypt(const unsigned char *key, size_t key_length,
+                              const unsigned char *ciphertext, size_t ciphertext_length,
+                              const unsigned char *aad, size_t aad_length,
+                              const unsigned char *nonce, size_t nonce_length,
+                              const unsigned char *tag, size_t tag_length,
+                              unsigned char *plaintext, size_t plaintext_capacity,
+                              size_t *plaintext_length);
 
 #endif

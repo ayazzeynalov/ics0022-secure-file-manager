@@ -152,3 +152,183 @@ cleanup:
     }
     return success;
 }
+
+static int valid_gcm_input(const unsigned char *key, size_t key_length,
+                           const unsigned char *data, size_t data_length,
+                           const unsigned char *aad, size_t aad_length)
+{
+    return key != NULL && key_length == CRYPTO_KEY_BYTES &&
+           (data != NULL || data_length == 0) && data_length <= INT_MAX &&
+           (aad != NULL || aad_length == 0) && aad_length <= INT_MAX;
+}
+
+static int ranges_overlap(const void *first, size_t first_length,
+                          const void *second, size_t second_length)
+{
+    uintptr_t first_address;
+    uintptr_t second_address;
+
+    if (first_length == 0 || second_length == 0) {
+        return 0;
+    }
+    first_address = (uintptr_t)first;
+    second_address = (uintptr_t)second;
+    if (first_address <= second_address) {
+        return second_address - first_address < first_length;
+    }
+    return first_address - second_address < second_length;
+}
+
+int crypto_aes256_gcm_encrypt(const unsigned char *key, size_t key_length,
+                              const unsigned char *plaintext, size_t plaintext_length,
+                              const unsigned char *aad, size_t aad_length,
+                              unsigned char *ciphertext, size_t ciphertext_capacity,
+                              size_t *ciphertext_length,
+                              unsigned char *nonce, size_t nonce_capacity,
+                              unsigned char *tag, size_t tag_capacity)
+{
+    EVP_CIPHER_CTX *context = NULL;
+    unsigned char temporary_nonce[CRYPTO_GCM_NONCE_BYTES] = {0};
+    unsigned char temporary_tag[CRYPTO_GCM_TAG_BYTES] = {0};
+    unsigned char empty_output = 0;
+    unsigned char *output = ciphertext == NULL ? &empty_output : ciphertext;
+    int written = 0;
+    int final_written = 0;
+    int aad_written = 0;
+    int success = 0;
+
+    if (ciphertext_length == NULL) {
+        return 0;
+    }
+    *ciphertext_length = 0;
+    if (!valid_gcm_input(key, key_length, plaintext, plaintext_length, aad, aad_length) ||
+        (ciphertext == NULL && (plaintext_length != 0 || ciphertext_capacity != 0)) ||
+        ciphertext_capacity < plaintext_length ||
+        nonce == NULL || nonce_capacity < CRYPTO_GCM_NONCE_BYTES ||
+        tag == NULL || tag_capacity < CRYPTO_GCM_TAG_BYTES ||
+        ranges_overlap(ciphertext, plaintext_length, plaintext, plaintext_length) ||
+        ranges_overlap(ciphertext, plaintext_length, key, key_length) ||
+        ranges_overlap(ciphertext, plaintext_length, aad, aad_length) ||
+        ranges_overlap(ciphertext, plaintext_length, nonce, CRYPTO_GCM_NONCE_BYTES) ||
+        ranges_overlap(ciphertext, plaintext_length, tag, CRYPTO_GCM_TAG_BYTES) ||
+        ranges_overlap(nonce, CRYPTO_GCM_NONCE_BYTES, tag, CRYPTO_GCM_TAG_BYTES) ||
+        ranges_overlap(nonce, CRYPTO_GCM_NONCE_BYTES, plaintext, plaintext_length) ||
+        ranges_overlap(nonce, CRYPTO_GCM_NONCE_BYTES, key, key_length) ||
+        ranges_overlap(nonce, CRYPTO_GCM_NONCE_BYTES, aad, aad_length) ||
+        ranges_overlap(tag, CRYPTO_GCM_TAG_BYTES, plaintext, plaintext_length) ||
+        ranges_overlap(tag, CRYPTO_GCM_TAG_BYTES, key, key_length) ||
+        ranges_overlap(tag, CRYPTO_GCM_TAG_BYTES, aad, aad_length)) {
+        return 0;
+    }
+    if (!crypto_random(temporary_nonce, sizeof(temporary_nonce))) {
+        goto cleanup;
+    }
+    context = EVP_CIPHER_CTX_new();
+    if (context == NULL ||
+        EVP_EncryptInit_ex2(context, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
+        EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_AEAD_SET_IVLEN,
+                            CRYPTO_GCM_NONCE_BYTES, NULL) != 1 ||
+        EVP_EncryptInit_ex2(context, NULL, key, temporary_nonce, NULL) != 1) {
+        goto cleanup;
+    }
+    if (aad_length != 0 &&
+        EVP_EncryptUpdate(context, NULL, &aad_written, aad, (int)aad_length) != 1) {
+        goto cleanup;
+    }
+    if (plaintext_length != 0 &&
+        EVP_EncryptUpdate(context, output, &written,
+                          plaintext, (int)plaintext_length) != 1) {
+        goto cleanup;
+    }
+    if (EVP_EncryptFinal_ex(context, output + written, &final_written) != 1 ||
+        written < 0 || final_written < 0 ||
+        (size_t)written + (size_t)final_written != plaintext_length ||
+        EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_AEAD_GET_TAG,
+                            CRYPTO_GCM_TAG_BYTES, temporary_tag) != 1) {
+        goto cleanup;
+    }
+    memcpy(nonce, temporary_nonce, sizeof(temporary_nonce));
+    memcpy(tag, temporary_tag, sizeof(temporary_tag));
+    *ciphertext_length = plaintext_length;
+    success = 1;
+
+cleanup:
+    EVP_CIPHER_CTX_free(context);
+    OPENSSL_cleanse(temporary_nonce, sizeof(temporary_nonce));
+    OPENSSL_cleanse(temporary_tag, sizeof(temporary_tag));
+    if (!success && ciphertext != NULL && plaintext_length != 0) {
+        OPENSSL_cleanse(ciphertext, plaintext_length);
+    }
+    return success;
+}
+
+int crypto_aes256_gcm_decrypt(const unsigned char *key, size_t key_length,
+                              const unsigned char *ciphertext, size_t ciphertext_length,
+                              const unsigned char *aad, size_t aad_length,
+                              const unsigned char *nonce, size_t nonce_length,
+                              const unsigned char *tag, size_t tag_length,
+                              unsigned char *plaintext, size_t plaintext_capacity,
+                              size_t *plaintext_length)
+{
+    EVP_CIPHER_CTX *context = NULL;
+    unsigned char *temporary = NULL;
+    int written = 0;
+    int final_written = 0;
+    int aad_written = 0;
+    int success = 0;
+    size_t temporary_length = ciphertext_length == 0 ? 1 : ciphertext_length;
+
+    if (plaintext_length == NULL) {
+        return 0;
+    }
+    *plaintext_length = 0;
+    if (!valid_gcm_input(key, key_length, ciphertext, ciphertext_length, aad, aad_length) ||
+        nonce == NULL || nonce_length != CRYPTO_GCM_NONCE_BYTES ||
+        tag == NULL || tag_length != CRYPTO_GCM_TAG_BYTES ||
+        (plaintext == NULL && (ciphertext_length != 0 || plaintext_capacity != 0)) ||
+        plaintext_capacity < ciphertext_length ||
+        ranges_overlap(plaintext, ciphertext_length, ciphertext, ciphertext_length) ||
+        ranges_overlap(plaintext, ciphertext_length, key, key_length) ||
+        ranges_overlap(plaintext, ciphertext_length, aad, aad_length) ||
+        ranges_overlap(plaintext, ciphertext_length, nonce, nonce_length) ||
+        ranges_overlap(plaintext, ciphertext_length, tag, tag_length)) {
+        return 0;
+    }
+    temporary = OPENSSL_malloc(temporary_length);
+    context = EVP_CIPHER_CTX_new();
+    if (temporary == NULL || context == NULL ||
+        EVP_DecryptInit_ex2(context, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
+        EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_AEAD_SET_IVLEN,
+                            CRYPTO_GCM_NONCE_BYTES, NULL) != 1 ||
+        EVP_DecryptInit_ex2(context, NULL, key, nonce, NULL) != 1) {
+        goto cleanup;
+    }
+    if (aad_length != 0 &&
+        EVP_DecryptUpdate(context, NULL, &aad_written, aad, (int)aad_length) != 1) {
+        goto cleanup;
+    }
+    if (ciphertext_length != 0 &&
+        EVP_DecryptUpdate(context, temporary, &written,
+                          ciphertext, (int)ciphertext_length) != 1) {
+        goto cleanup;
+    }
+    if (EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_AEAD_SET_TAG,
+                            CRYPTO_GCM_TAG_BYTES, (void *)tag) != 1 ||
+        EVP_DecryptFinal_ex(context, temporary + written, &final_written) != 1 ||
+        written < 0 || final_written < 0 ||
+        (size_t)written + (size_t)final_written != ciphertext_length) {
+        goto cleanup;
+    }
+    if (ciphertext_length != 0) {
+        memcpy(plaintext, temporary, ciphertext_length);
+    }
+    *plaintext_length = ciphertext_length;
+    success = 1;
+
+cleanup:
+    EVP_CIPHER_CTX_free(context);
+    if (temporary != NULL) {
+        OPENSSL_clear_free(temporary, temporary_length);
+    }
+    return success;
+}
