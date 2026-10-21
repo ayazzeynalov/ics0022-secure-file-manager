@@ -7,7 +7,7 @@ I originally selected the Secure File Manager project, but changed to **Secure P
 ## Current stage
 
 The **Checkpoint 1: threat model and architecture** design is preserved while preparing for **Checkpoint 2: core implementation**.
-The interface remains a CLI skeleton. A separate crypto module now provides random bytes, scrypt root-key derivation, HKDF-SHA256 key separation, and AES-256-GCM authenticated encryption, with unit tests. Vault storage and authentication are not implemented yet.
+The interface remains a CLI skeleton. The crypto module provides random bytes, scrypt root-key derivation, HKDF-SHA256 key separation, and AES-256-GCM authenticated encryption. The authentication module provides master-password verifier primitives and VMK protection. User records, vault storage, and login sessions are not implemented yet.
 
 The supplied Password Manager checkpoint requirements call for working vault storage, credentials encrypted at rest, master-password verification before unlocking, an interface that never prints plaintext passwords, clean-machine build instructions, incremental commits, and a short progress note. These functional requirements remain pending; this setup is not a completed Checkpoint 2 submission. The File Manager encryption/decryption commands in the same sheet apply to the other project.
 
@@ -95,6 +95,21 @@ Callers must supply valid buffers of the declared sizes, keep outputs separate f
 
 `crypto_aes256_gcm_encrypt()` uses a 32-byte key, generates a fresh 12-byte nonce with `crypto_random()`, supports optional AAD, and returns ciphertext plus a 16-byte authentication tag. `crypto_aes256_gcm_decrypt()` accepts the same parameters and releases plaintext only after the tag is verified. Authentication failure leaves the caller's plaintext buffer untouched and reports a zero output length. Empty plaintext is supported. Input and output buffers must be distinct, message and AAD lengths are limited to `INT_MAX`, and ciphertext has the same length as plaintext. Nonce uniqueness depends on OpenSSL's random generator succeeding; no nonce state is persisted by this module.
 
+## Authentication and VMK protection
+
+`src/auth.h` defines reusable primitives; it does not implement users, login sessions, or persistence. `auth_create_verifier()` computes a 32-byte HMAC-SHA256 using the 32-byte authentication key and the exact ASCII message `securepm:auth-verifier:v1`, excluding its terminating NUL. `auth_verify_verifier()` recalculates it and compares all 32 bytes with OpenSSL `CRYPTO_memcmp()`. This verifier permits offline password guesses if authentication metadata is stolen; resistance depends on the preceding per-user scrypt derivation and the strength of the master password.
+
+`auth_generate_wrapped_vmk()` generates a random 32-byte VMK and protects it with the 32-byte KEK through the existing AES-256-GCM API. It returns the VMK for immediate in-memory vault use together with a 32-byte wrapped VMK, 12-byte nonce, and 16-byte tag. `auth_unwrap_vmk()` publishes the VMK only after GCM authentication succeeds. Callers must never persist the plaintext VMK and must clear it when the vault locks.
+
+VMK wrapping authenticates this exact binary AAD sequence, with no NUL terminator or padding:
+
+1. 17 ASCII bytes: `securepm:vmk-wrap`
+2. Format version as a 4-byte unsigned big-endian integer; the only supported value is currently `1`.
+3. User-ID length as a 2-byte unsigned big-endian integer.
+4. The application-generated user-ID bytes, with a current allowed length of 1–255 bytes.
+
+Thus the AAD length is `23 + user_id_length`. Future storage must persist the format version and exact user ID alongside the wrapped VMK, nonce, and tag, then reconstruct this sequence byte-for-byte. Modifying the version or user ID causes unwrapping to fail.
+
 ## Planned interface
 
 ```text
@@ -155,7 +170,7 @@ An OpenSSL probe checks both headers and the loaded library for major version 3.
 
 The smoke test checks seven CLI cases: `--help`, `-h`, no arguments, an unknown option, extra arguments, an unimplemented command, and an empty argument. It checks output and exit status, not vault security or authentication.
 
-`make test` also runs cryptographic unit tests for deterministic scrypt derivation, salt separation, HKDF key separation and repeatability, AES-GCM round trips and authentication failures, buffer boundaries, invalid inputs, and failure cleanup. HKDF is checked against [RFC 5869 Appendix A, cases 1 and 3](https://www.rfc-editor.org/rfc/rfc5869#appendix-A), and AES-GCM decryption uses a published AES-256-GCM known-answer vector. Tests use dummy data and never print key bytes. Production-cost scrypt is exercised; only input-boundary tests use smaller costs. These tests do not constitute a security audit or a benchmark of password-guessing resistance.
+`make test` also runs unit tests for deterministic scrypt derivation, salt separation, HKDF key separation and repeatability, AES-GCM round trips and authentication failures, verifier creation and checking, VMK protection and AAD binding, buffer boundaries, invalid inputs, and failure cleanup. HKDF is checked against [RFC 5869 Appendix A, cases 1 and 3](https://www.rfc-editor.org/rfc/rfc5869#appendix-A), and AES-GCM decryption uses a published AES-256-GCM known-answer vector. Tests use dummy data and never print key bytes. Production-cost scrypt is exercised; only input-boundary tests use smaller costs. These tests do not constitute a security audit or a benchmark of password-guessing resistance.
 
 Clean build files:
 
@@ -174,12 +189,15 @@ make clean
 │   ├── main.c              # program entry point
 │   ├── cli.c               # help and argument dispatch
 │   ├── cli.h
+│   ├── auth.c              # verifier and VMK protection primitives
+│   ├── auth.h
 │   ├── crypto.c            # randomness and key derivation
 │   └── crypto.h
 ├── tools/
 │   └── check_openssl.c     # build dependency/version probe
 └── tests/
     ├── smoke.sh           # CLI integration smoke test
+    ├── test_auth.c        # authentication and VMK unit tests
     └── test_crypto.c      # cryptographic unit tests
 ```
 
@@ -192,7 +210,6 @@ Add implementation/header pairs under `src/` as each feature is developed:
 | `input.c` / `input.h` | Bounded interactive input and terminal echo control |
 | `storage.c` / `storage.h` | Vault file I/O, permissions, and safe replacement |
 | `serialization.c` / `serialization.h` | Vault encoding, decoding, and format validation |
-| `auth.c` / `auth.h` | User authentication and unlocked-session lifetime |
 | `vault.c` / `vault.h` | Credential operations and coordination of storage and cryptography |
 
 These are planned boundaries, not implemented APIs. Further unit tests and integration tests will live under `tests/` alongside the current tests. No empty module implementations are included.

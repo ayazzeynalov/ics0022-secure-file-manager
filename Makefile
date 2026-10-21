@@ -15,9 +15,9 @@ endif
 OPENSSL_LIBS ?= -lcrypto
 
 TARGET = securepm
-SRC = src/main.c src/cli.c src/crypto.c
+SRC = src/main.c src/cli.c src/crypto.c src/auth.c
 OBJ = $(SRC:src/%.c=build/%.o)
-DEP = $(OBJ:.o=.d) build/test_crypto.d
+DEP = $(OBJ:.o=.d) build/test_crypto.d build/test_auth.d
 
 .PHONY: all clean test check-openssl
 all: $(TARGET)
@@ -43,9 +43,16 @@ build/test_crypto.o: tests/test_crypto.c | build check-openssl
 build/test_crypto: build/test_crypto.o build/crypto.o | check-openssl
 	$(CC) $(LDFLAGS) $^ $(OPENSSL_LIBS) $(LDLIBS) -o $@
 
-test: $(TARGET) build/test_crypto
+build/test_auth.o: tests/test_auth.c | build check-openssl
+	$(CC) $(CPPFLAGS) -Isrc $(OPENSSL_CFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
+
+build/test_auth: build/test_auth.o build/auth.o build/crypto.o | check-openssl
+	$(CC) $(LDFLAGS) $^ $(OPENSSL_LIBS) $(LDLIBS) -o $@
+
+test: $(TARGET) build/test_crypto build/test_auth
 	sh tests/smoke.sh ./$(TARGET)
 	./build/test_crypto
+	./build/test_auth
 
 clean:
 	rm -rf build
