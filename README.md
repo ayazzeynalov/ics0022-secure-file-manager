@@ -7,7 +7,7 @@ I originally selected the Secure File Manager project, but changed to **Secure P
 ## Current stage
 
 The **Checkpoint 1: threat model and architecture** design is preserved while preparing for **Checkpoint 2: core implementation**.
-The interface remains a CLI skeleton. The crypto module provides random bytes, scrypt root-key derivation, HKDF-SHA256 key separation, and AES-256-GCM authenticated encryption. The authentication module provides master-password verifier primitives and VMK protection. The storage module provides secure directory initialization, bounded reads, and atomic file replacement. The user database module persists validated authentication metadata for multiple users. Registration, encrypted vault serialization, and login sessions are not implemented yet.
+The interface remains a CLI skeleton. The crypto module provides random bytes, scrypt root-key derivation, HKDF-SHA256 key separation, and AES-256-GCM authenticated encryption. The authentication module provides master-password verifier primitives and VMK protection. The storage and user database modules persist validated authentication metadata. The account module provides non-interactive registration, unlock, and session locking. Password prompts, encrypted vault serialization, and CLI account commands are not implemented yet.
 
 The supplied Password Manager checkpoint requirements call for working vault storage, credentials encrypted at rest, master-password verification before unlocking, an interface that never prints plaintext passwords, clean-machine build instructions, incremental commits, and a short progress note. These functional requirements remain pending; this setup is not a completed Checkpoint 2 submission. The File Manager encryption/decryption commands in the same sheet apply to the other project.
 
@@ -126,6 +126,14 @@ The binary format does not serialize C structures. It starts with the 8 ASCII by
 
 The database intentionally contains password-verification material and an encrypted VMK, but no master password, derived key, KEK, or plaintext VMK. File permissions prevent access by other users; the format does not add a separate whole-file authentication code, so an attacker who can already write files as the account owner can cause denial of service or alter metadata. VMK ciphertext integrity remains enforced by its GCM tag when later unwrapped.
 
+## Account registration and unlock
+
+`src/account.h` composes the existing modules without performing terminal input. `account_register()` accepts a validated username and an explicit 1–1024 byte password, rejects duplicate usernames, generates a unique random 16-byte user ID and random salt, derives the separated authentication key and KEK with the production scrypt profile, creates the verifier, wraps a random VMK, and atomically saves the resulting user record. The supplied password remains owned by the caller and is never persisted.
+
+`account_unlock()` returns one generic success/failure result. It clears the supplied session before attempting a load, lookup, or derivation; validates the verifier before unwrapping the VMK; and publishes the user ID and VMK only after GCM authentication succeeds. `account_session_lock()` securely clears the VMK and resets the session. Root keys are cleared immediately after key separation, and temporary authentication keys, KEKs, and VMKs are cleared as soon as they are no longer needed and again on cleanup paths.
+
+The current account layer has no password-strength policy beyond the cryptographic length bounds, no retry throttling, and no multi-process registration lock. A future CLI should present generic unlock errors and add rate limiting. Concurrent read-modify-save registrations can overwrite each other until storage-level coordination is added.
+
 ## Planned interface
 
 ```text
@@ -186,7 +194,7 @@ An OpenSSL probe checks both headers and the loaded library for major version 3.
 
 The smoke test checks seven CLI cases: `--help`, `-h`, no arguments, an unknown option, extra arguments, an unimplemented command, and an empty argument. It checks output and exit status, not vault security or authentication.
 
-`make test` also runs unit tests for deterministic scrypt derivation, salt separation, HKDF key separation and repeatability, AES-GCM round trips and authentication failures, verifier creation and checking, VMK protection and AAD binding, secure filesystem behavior, and user database parsing and persistence. Storage and database tests use isolated temporary `HOME` directories. Database tests cover multiple records, uniqueness, reopen persistence, permissions, fixed-endian encoding, malformed inputs, unsupported versions and scrypt profiles, truncation, and trailing data. HKDF is checked against [RFC 5869 Appendix A, cases 1 and 3](https://www.rfc-editor.org/rfc/rfc5869#appendix-A), and AES-GCM decryption uses a published AES-256-GCM known-answer vector. Tests use dummy data and never print key bytes. Production-cost scrypt is exercised; only input-boundary tests use smaller costs. These tests do not constitute a security audit or a benchmark of password-guessing resistance.
+`make test` also runs unit tests for deterministic scrypt derivation, salt separation, HKDF key separation and repeatability, AES-GCM round trips and authentication failures, verifier creation and checking, VMK protection and AAD binding, secure filesystem behavior, user database persistence, and account registration/unlock. Filesystem-facing tests use isolated temporary `HOME` directories. Account tests cover separate storage instances, wrong passwords, duplicate and missing users, corrupted metadata, malformed databases, session clearing, and the absence of supplied passwords and plaintext VMKs on disk. HKDF is checked against [RFC 5869 Appendix A, cases 1 and 3](https://www.rfc-editor.org/rfc/rfc5869#appendix-A), and AES-GCM decryption uses a published AES-256-GCM known-answer vector. Tests use dummy data and never print key bytes. Production-cost scrypt is exercised; only input-boundary tests use smaller costs. These tests do not constitute a security audit or a benchmark of password-guessing resistance.
 
 Clean build files:
 
@@ -207,6 +215,8 @@ make clean
 │   ├── cli.h
 │   ├── auth.c              # verifier and VMK protection primitives
 │   ├── auth.h
+│   ├── account.c           # registration, unlock, and session locking
+│   ├── account.h
 │   ├── crypto.c            # randomness and key derivation
 │   ├── crypto.h
 │   ├── storage.c           # secure filesystem operations
@@ -217,6 +227,7 @@ make clean
 │   └── check_openssl.c     # build dependency/version probe
 └── tests/
     ├── smoke.sh           # CLI integration smoke test
+    ├── test_account.c     # account integration tests
     ├── test_auth.c        # authentication and VMK unit tests
     ├── test_crypto.c      # cryptographic unit tests
     ├── test_storage.c     # storage unit tests
