@@ -7,7 +7,7 @@ I originally selected the Secure File Manager project, but changed to **Secure P
 ## Current stage
 
 The **Checkpoint 1: threat model and architecture** design is preserved while preparing for **Checkpoint 2: core implementation**.
-The interface remains a CLI skeleton. The crypto module provides random bytes, scrypt root-key derivation, HKDF-SHA256 key separation, and AES-256-GCM authenticated encryption. The authentication module provides master-password verifier primitives and VMK protection. The storage module provides secure directory initialization, bounded reads, and atomic file replacement. User record formats, encrypted vault serialization, and login sessions are not implemented yet.
+The interface remains a CLI skeleton. The crypto module provides random bytes, scrypt root-key derivation, HKDF-SHA256 key separation, and AES-256-GCM authenticated encryption. The authentication module provides master-password verifier primitives and VMK protection. The storage module provides secure directory initialization, bounded reads, and atomic file replacement. The user database module persists validated authentication metadata for multiple users. Registration, encrypted vault serialization, and login sessions are not implemented yet.
 
 The supplied Password Manager checkpoint requirements call for working vault storage, credentials encrypted at rest, master-password verification before unlocking, an interface that never prints plaintext passwords, clean-machine build instructions, incremental commits, and a short progress note. These functional requirements remain pending; this setup is not a completed Checkpoint 2 submission. The File Manager encryption/decryption commands in the same sheet apply to the other project.
 
@@ -80,9 +80,9 @@ More detailed threat-model notes are included in the Checkpoint 1 submission.
 
 ## Cryptographic module
 
-`src/crypto.h` defines the public API. Functions return `1` on success and `0` on failure; they do not print secrets or errors. `crypto_random()` uses OpenSSL `RAND_bytes()` and accepts nonempty buffers up to `INT_MAX` bytes. Generate a fresh `CRYPTO_SALT_BYTES` (16-byte) salt for each future user record; user creation and salt persistence are not implemented.
+`src/crypto.h` defines the public API. Functions return `1` on success and `0` on failure; they do not print secrets or errors. `crypto_random()` uses OpenSSL `RAND_bytes()` and accepts nonempty buffers up to `INT_MAX` bytes. Future registration must generate a fresh `CRYPTO_SALT_BYTES` (16-byte) salt for each user; the user database persists supplied salts, but user creation is not implemented.
 
-`crypto_derive_root()` takes an explicit password byte length, a 16-byte salt, and a `crypto_scrypt_params` structure, and produces exactly 32 bytes. `crypto_scrypt_defaults` specifies **N=32768, r=8, p=1, max_memory=67108864 bytes (64 MiB)**. Passwords are bounded to 1–1024 bytes without truncation. Supported parameter bounds are power-of-two N from 2 to 32768, r from 1 to 8, p=1, and a positive memory limit no larger than 64 MiB. OpenSSL rejects settings whose memory requirements exceed that limit. Smaller costs are supported for tests and future compatibility; new user records must use the production defaults. A future metadata loader must enforce its accepted cost profile as well as these resource bounds.
+`crypto_derive_root()` takes an explicit password byte length, a 16-byte salt, and a `crypto_scrypt_params` structure, and produces exactly 32 bytes. `crypto_scrypt_defaults` specifies **N=32768, r=8, p=1, max_memory=67108864 bytes (64 MiB)**. Passwords are bounded to 1–1024 bytes without truncation. Supported parameter bounds are power-of-two N from 2 to 32768, r from 1 to 8, p=1, and a positive memory limit no larger than 64 MiB. OpenSSL rejects settings whose memory requirements exceed that limit. Smaller costs are supported for tests and future compatibility; version 1 user records require the production defaults exactly.
 
 `crypto_derive_keys()` produces a `crypto_keys` structure containing a 32-byte authentication key and a 32-byte KEK. It uses HKDF-SHA256 extract-and-expand with no additional HKDF salt and these exact ASCII context labels, excluding their terminating NUL bytes:
 
@@ -108,7 +108,7 @@ VMK wrapping authenticates this exact binary AAD sequence, with no NUL terminato
 3. User-ID length as a 2-byte unsigned big-endian integer.
 4. The application-generated user-ID bytes, with a current allowed length of 1–255 bytes.
 
-Thus the AAD length is `23 + user_id_length`. Future storage must persist the format version and exact user ID alongside the wrapped VMK, nonce, and tag, then reconstruct this sequence byte-for-byte. Modifying the version or user ID causes unwrapping to fail.
+Thus the AAD length is `23 + user_id_length`. The user database persists the format version and exact user ID alongside the wrapped VMK, nonce, and tag. Future login code must reconstruct this sequence byte-for-byte. Modifying the version or user ID causes unwrapping to fail.
 
 ## Filesystem storage
 
@@ -117,6 +117,14 @@ Thus the AAD length is `23 + user_id_length`. Future storage must persist the fo
 `storage_read_file()` performs bounded reads and distinguishes a missing file from an unsafe object or I/O error. `storage_atomic_write()` writes at most 16 MiB to a same-directory temporary file created exclusively with mode `0600`, flushes and closes it, revalidates any destination, renames it atomically, and synchronizes the directory. Existing files must be regular files owned by the effective user with exact mode `0600` and one hard link. Files are addressed relative to retained directory descriptors with `openat()` and related APIs; public filenames are limited to 1–128 ASCII bytes, must start with an alphanumeric character, and may otherwise contain only alphanumerics, `.`, `_`, and `-`. This prevents path separators and traversal components. Future vault code must use application-generated user IDs for filenames and pass only metadata or already-encrypted vault bytes to this module.
 
 On macOS, file flushing uses `F_FULLFSYNC` when supported and falls back to `fsync()`. Some macOS filesystems do not support directory `fsync()`; `EINVAL` and `ENOTSUP` are treated as the platform's best available behavior. Linux uses `fsync()` for files and directories. The module checks POSIX mode bits and ownership but does not inspect platform-specific ACLs, extended attributes, or network-filesystem atomicity guarantees.
+
+## User database
+
+`src/user_db.h` provides an in-memory database of at most 256 users with load, find, add, and save operations. A missing `users.db` loads as an empty database; an existing malformed file is an error. Usernames are 1–64 visible ASCII bytes and are compared exactly and case-sensitively. Both usernames and 16-byte application-generated user IDs must be unique. Version 1 records accept only `crypto_scrypt_defaults`.
+
+The binary format does not serialize C structures. It starts with the 8 ASCII bytes `SPMUSRDB`, followed by a 32-bit file version and 32-bit record count. Each record contains a 32-bit record/VMK-wrap format version, a 16-bit username length and the username bytes, then the 16-byte user ID, 16-byte scrypt salt, four 64-bit scrypt parameters (`N`, `r`, `p`, and memory limit), 32-byte authentication verifier, 32-byte wrapped VMK, 12-byte nonce, and 16-byte tag. Every integer is unsigned big-endian. The parser rejects unsupported versions or parameter profiles, invalid lengths, duplicates, truncation, trailing data, and counts above 256 before publishing the loaded database.
+
+The database intentionally contains password-verification material and an encrypted VMK, but no master password, derived key, KEK, or plaintext VMK. File permissions prevent access by other users; the format does not add a separate whole-file authentication code, so an attacker who can already write files as the account owner can cause denial of service or alter metadata. VMK ciphertext integrity remains enforced by its GCM tag when later unwrapped.
 
 ## Planned interface
 
@@ -178,7 +186,7 @@ An OpenSSL probe checks both headers and the loaded library for major version 3.
 
 The smoke test checks seven CLI cases: `--help`, `-h`, no arguments, an unknown option, extra arguments, an unimplemented command, and an empty argument. It checks output and exit status, not vault security or authentication.
 
-`make test` also runs unit tests for deterministic scrypt derivation, salt separation, HKDF key separation and repeatability, AES-GCM round trips and authentication failures, verifier creation and checking, VMK protection and AAD binding, and secure filesystem behavior. Storage tests use an isolated temporary `HOME` and cover permissions, bounded reads, atomic replacement, unsafe objects, symlinks, oversized files, missing files, and failed-write cleanup. HKDF is checked against [RFC 5869 Appendix A, cases 1 and 3](https://www.rfc-editor.org/rfc/rfc5869#appendix-A), and AES-GCM decryption uses a published AES-256-GCM known-answer vector. Tests use dummy data and never print key bytes. Production-cost scrypt is exercised; only input-boundary tests use smaller costs. These tests do not constitute a security audit or a benchmark of password-guessing resistance.
+`make test` also runs unit tests for deterministic scrypt derivation, salt separation, HKDF key separation and repeatability, AES-GCM round trips and authentication failures, verifier creation and checking, VMK protection and AAD binding, secure filesystem behavior, and user database parsing and persistence. Storage and database tests use isolated temporary `HOME` directories. Database tests cover multiple records, uniqueness, reopen persistence, permissions, fixed-endian encoding, malformed inputs, unsupported versions and scrypt profiles, truncation, and trailing data. HKDF is checked against [RFC 5869 Appendix A, cases 1 and 3](https://www.rfc-editor.org/rfc/rfc5869#appendix-A), and AES-GCM decryption uses a published AES-256-GCM known-answer vector. Tests use dummy data and never print key bytes. Production-cost scrypt is exercised; only input-boundary tests use smaller costs. These tests do not constitute a security audit or a benchmark of password-guessing resistance.
 
 Clean build files:
 
@@ -202,14 +210,17 @@ make clean
 │   ├── crypto.c            # randomness and key derivation
 │   ├── crypto.h
 │   ├── storage.c           # secure filesystem operations
-│   └── storage.h
+│   ├── storage.h
+│   ├── user_db.c           # versioned user metadata persistence
+│   └── user_db.h
 ├── tools/
 │   └── check_openssl.c     # build dependency/version probe
 └── tests/
     ├── smoke.sh           # CLI integration smoke test
     ├── test_auth.c        # authentication and VMK unit tests
     ├── test_crypto.c      # cryptographic unit tests
-    └── test_storage.c     # storage unit tests
+    ├── test_storage.c     # storage unit tests
+    └── test_user_db.c     # user database unit tests
 ```
 
 Objects and generated header dependencies go in the ignored `build/` directory. The executable remains `securepm`.
