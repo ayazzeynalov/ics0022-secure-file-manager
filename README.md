@@ -7,7 +7,7 @@ I originally selected the Secure File Manager project, but changed to **Secure P
 ## Current stage
 
 The **Checkpoint 1: threat model and architecture** design is preserved while preparing for **Checkpoint 2: core implementation**.
-The program still contains only a CLI skeleton. Initial setup separates CLI dispatch from the entry point, adds OpenSSL dependency checks, and tests the existing help and argument handling. Encrypted vault storage and authentication are not implemented yet.
+The interface remains a CLI skeleton. A separate crypto module now provides random bytes, scrypt root-key derivation, and HKDF-SHA256 key separation, with unit tests. Encrypted vault storage and authentication are not implemented yet.
 
 The supplied Password Manager checkpoint requirements call for working vault storage, credentials encrypted at rest, master-password verification before unlocking, an interface that never prints plaintext passwords, clean-machine build instructions, incremental commits, and a short progress note. These functional requirements remain pending; this setup is not a completed Checkpoint 2 submission. The File Manager encryption/decryption commands in the same sheet apply to the other project.
 
@@ -78,6 +78,21 @@ The main threats considered for Checkpoint 1 are:
 
 More detailed threat-model notes are included in the Checkpoint 1 submission.
 
+## Key derivation module
+
+`src/crypto.h` defines the public API. Functions return `1` on success and `0` on failure; they do not print secrets or errors. `crypto_random()` uses OpenSSL `RAND_bytes()` and accepts nonempty buffers up to `INT_MAX` bytes. Generate a fresh `CRYPTO_SALT_BYTES` (16-byte) salt for each future user record; user creation and salt persistence are not implemented.
+
+`crypto_derive_root()` takes an explicit password byte length, a 16-byte salt, and a `crypto_scrypt_params` structure, and produces exactly 32 bytes. `crypto_scrypt_defaults` specifies **N=32768, r=8, p=1, max_memory=67108864 bytes (64 MiB)**. Passwords are bounded to 1–1024 bytes without truncation. Supported parameter bounds are power-of-two N from 2 to 32768, r from 1 to 8, p=1, and a positive memory limit no larger than 64 MiB. OpenSSL rejects settings whose memory requirements exceed that limit. Smaller costs are supported for tests and future compatibility; new user records must use the production defaults. A future metadata loader must enforce its accepted cost profile as well as these resource bounds.
+
+`crypto_derive_keys()` produces a `crypto_keys` structure containing a 32-byte authentication key and a 32-byte KEK. It uses HKDF-SHA256 extract-and-expand with no additional HKDF salt and these exact ASCII context labels, excluding their terminating NUL bytes:
+
+- Authentication key: `securepm:v1:auth`
+- Key Encryption Key: `securepm:v1:kek`
+
+The labels are versioned derivation inputs; changing them changes the keys. `crypto_hkdf_sha256()` exposes the underlying primitive for reuse and reference-vector testing, with input buffers limited to 1024 bytes each and output limited to 1–8160 bytes.
+
+Callers must supply valid buffers of the declared sizes, keep outputs separate from inputs, and clear passwords, returned root keys, and separated keys with `OPENSSL_cleanse()` when no longer needed. The module clears its intermediate secret buffers on success and failure and frees OpenSSL contexts. Failed derivations clear valid-sized output buffers; invalid output pointers or lengths are rejected without writing. It does not implement locked memory or protection against privileged process inspection.
+
 ## Planned interface
 
 ```text
@@ -138,6 +153,8 @@ An OpenSSL probe checks both headers and the loaded library for major version 3.
 
 The smoke test checks seven CLI cases: `--help`, `-h`, no arguments, an unknown option, extra arguments, an unimplemented command, and an empty argument. It checks output and exit status, not vault security or authentication.
 
+`make test` also runs cryptographic unit tests for deterministic scrypt derivation, salt separation, HKDF key separation and repeatability, buffer boundaries, invalid inputs, and failure cleanup. HKDF is checked against [RFC 5869 Appendix A, cases 1 and 3](https://www.rfc-editor.org/rfc/rfc5869#appendix-A). Tests use dummy data and never print key bytes. Production-cost scrypt is exercised; only input-boundary tests use smaller costs. These tests do not constitute a security audit or a benchmark of password-guessing resistance.
+
 Clean build files:
 
 ```bash
@@ -154,11 +171,14 @@ make clean
 ├── src/
 │   ├── main.c              # program entry point
 │   ├── cli.c               # help and argument dispatch
-│   └── cli.h
+│   ├── cli.h
+│   ├── crypto.c            # randomness and key derivation
+│   └── crypto.h
 ├── tools/
 │   └── check_openssl.c     # build dependency/version probe
 └── tests/
-    └── smoke.sh           # CLI integration smoke test
+    ├── smoke.sh           # CLI integration smoke test
+    └── test_crypto.c      # cryptographic unit tests
 ```
 
 Objects and generated header dependencies go in the ignored `build/` directory. The executable remains `securepm`.
@@ -167,11 +187,10 @@ Add implementation/header pairs under `src/` as each feature is developed:
 
 | Module | Responsibility |
 | --- | --- |
-| `crypto.c` / `crypto.h` | OpenSSL KDF, key separation, randomness, and authenticated encryption |
 | `input.c` / `input.h` | Bounded interactive input and terminal echo control |
 | `storage.c` / `storage.h` | Vault file I/O, permissions, and safe replacement |
 | `serialization.c` / `serialization.h` | Vault encoding, decoding, and format validation |
 | `auth.c` / `auth.h` | User authentication and unlocked-session lifetime |
 | `vault.c` / `vault.h` | Credential operations and coordination of storage and cryptography |
 
-These are planned boundaries, not implemented APIs. Unit tests for individual modules and integration tests for complete workflows will live under `tests/` alongside the existing smoke test. No empty module implementations are included.
+These are planned boundaries, not implemented APIs. Authenticated encryption will later extend the existing crypto module. Further unit tests and integration tests will live under `tests/` alongside the current tests. No empty module implementations are included.
