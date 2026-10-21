@@ -39,6 +39,28 @@ static int make_path(char output[TEST_PATH_BYTES],
     return length >= 0 && (size_t)length < TEST_PATH_BYTES;
 }
 
+static char *make_temporary_home(char home_template[TEST_PATH_BYTES])
+{
+    const char *temporary_parent = getenv("TMPDIR");
+    char *canonical_parent;
+    int path_ready;
+
+    if (temporary_parent == NULL || temporary_parent[0] == '\0') {
+        temporary_parent = "/tmp";
+    }
+    canonical_parent = realpath(temporary_parent, NULL);
+    if (canonical_parent == NULL) {
+        return NULL;
+    }
+    path_ready = make_path(home_template, canonical_parent,
+                           "securepm-storage-test.XXXXXX");
+    free(canonical_parent);
+    if (!path_ready) {
+        return NULL;
+    }
+    return mkdtemp(home_template);
+}
+
 static int write_direct(const char *path, const unsigned char *data,
                         size_t data_length, mode_t mode)
 {
@@ -377,15 +399,21 @@ static void test_failed_write_cleanup(const struct storage *storage,
 
 int main(void)
 {
-    char home_template[] = "/private/tmp/securepm-storage-test.XXXXXX";
-    char *home = mkdtemp(home_template);
+    char home_template[TEST_PATH_BYTES];
+    char *home = make_temporary_home(home_template);
     struct storage storage = STORAGE_INITIALIZER;
+    int home_set;
 
     CHECK(home != NULL);
     if (home == NULL) {
         return 1;
     }
-    CHECK(setenv("HOME", home, 1) == 0);
+    home_set = setenv("HOME", home, 1) == 0;
+    CHECK(home_set);
+    if (!home_set) {
+        CHECK(remove_tree(home));
+        return 1;
+    }
     test_unsafe_storage_root_rejected(home);
     CHECK(storage_init(&storage) == 1);
     if (storage.root_fd >= 0 && storage.vaults_fd >= 0) {
