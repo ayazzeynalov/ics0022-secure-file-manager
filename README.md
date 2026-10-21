@@ -22,7 +22,7 @@ The password manager will:
 - validate all user input;
 - enforce per-user ownership of stored records.
 
-The interface will be a local command-line application written in C.
+The interface will be a local command-line application written in C17 using OpenSSL 3.x and POSIX APIs.
 
 ## Planned design
 
@@ -58,13 +58,16 @@ Planned storage:
 ## Security decisions
 
 - **Master password:** entered interactively with terminal echo disabled. It will not be stored in plaintext.
-- **Password KDF:** planned to use scrypt through OpenSSL.
-- **Key separation:** HKDF-SHA256 with distinct purpose-specific contexts.
-- **Vault encryption:** AES-256-GCM.
-- **Vault key:** a random 256-bit Vault Master Key (VMK), protected by a key derived from the master password.
-- **File permissions:** private application directories/files will use restrictive permissions.
+- **Password KDF:** scrypt through OpenSSL with a per-user random salt. Salt and KDF parameters will be stored with the user record; cost parameters will be benchmarked before authentication is finalized.
+- **Key separation:** HKDF-SHA256 with distinct contexts for the authentication key and key-encryption key (KEK). A verifier derived from the authentication key will be stored separately in `users.db`.
+- **Vault encryption:** AES-256-GCM with a fresh 12-byte nonce for each encryption and a 16-byte authentication tag. Randomness will come from OpenSSL `RAND_bytes()`; failed authentication-tag verification must reject the vault.
+- **Vault key:** a random 256-bit Vault Master Key (VMK), protected by the password-derived KEK.
+- **Cryptographic APIs:** use established OpenSSL APIs, not custom cryptographic algorithms. Passwords and encryption keys must never be hardcoded.
+- **File permissions:** application directories will use `0700` and files `0600`. Vault filenames will use application-generated user IDs, not usernames or credential labels. Filesystem operations must guard against path traversal and symlink redirection.
+- **Vault updates:** write encrypted temporary files and replace the previous vault only after a successful write; never write plaintext temporary files. Keep local vault data out of version control.
+- **Input and ownership:** validate lengths, counts, formats, and size calculations before allocation or copying; check return values and enforce ownership on every protected record operation.
 - **Memory:** password/key buffers will be cleared after use.
-- **Errors/logging:** user-facing errors will be generic and logs will not contain secrets.
+- **Errors/logging:** user-facing errors will be generic. Structured logs will use an allow-list of non-secret event fields and never contain passwords, encryption keys, or credential contents.
 
 The main threats considered for Checkpoint 1 are:
 
@@ -148,7 +151,6 @@ make clean
 ├── README.md
 ├── Makefile
 ├── .gitignore
-├── AGENTS.md
 ├── src/
 │   ├── main.c              # program entry point
 │   ├── cli.c               # help and argument dispatch
