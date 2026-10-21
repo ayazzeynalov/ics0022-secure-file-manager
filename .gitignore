@@ -1,5 +1,6 @@
 # Build files
 securepm
+build/
 src/*.o
 *.dSYM/
 
