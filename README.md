@@ -7,7 +7,7 @@ I originally selected the Secure File Manager project, but changed to **Secure P
 ## Current stage
 
 The **Checkpoint 1: threat model and architecture** design is preserved while preparing for **Checkpoint 2: core implementation**.
-The interface remains a CLI skeleton. The crypto module provides random bytes, scrypt root-key derivation, HKDF-SHA256 key separation, and AES-256-GCM authenticated encryption. The authentication module provides master-password verifier primitives and VMK protection. User records, vault storage, and login sessions are not implemented yet.
+The interface remains a CLI skeleton. The crypto module provides random bytes, scrypt root-key derivation, HKDF-SHA256 key separation, and AES-256-GCM authenticated encryption. The authentication module provides master-password verifier primitives and VMK protection. The storage module provides secure directory initialization, bounded reads, and atomic file replacement. User record formats, encrypted vault serialization, and login sessions are not implemented yet.
 
 The supplied Password Manager checkpoint requirements call for working vault storage, credentials encrypted at rest, master-password verification before unlocking, an interface that never prints plaintext passwords, clean-machine build instructions, incremental commits, and a short progress note. These functional requirements remain pending; this setup is not a completed Checkpoint 2 submission. The File Manager encryption/decryption commands in the same sheet apply to the other project.
 
@@ -110,6 +110,14 @@ VMK wrapping authenticates this exact binary AAD sequence, with no NUL terminato
 
 Thus the AAD length is `23 + user_id_length`. Future storage must persist the format version and exact user ID alongside the wrapped VMK, nonce, and tag, then reconstruct this sequence byte-for-byte. Modifying the version or user ID causes unwrapping to fail.
 
+## Filesystem storage
+
+`src/storage.h` provides a crypto-independent storage context for the application root and vault directory. `storage_init()` opens the absolute `HOME` path one component at a time without following symlinks, verifies that `HOME` belongs to the effective user, and creates or validates `~/.securepm/` and `~/.securepm/vaults/` with mode `0700`. Existing directories with the wrong owner, type, or permissions are rejected.
+
+`storage_read_file()` performs bounded reads and distinguishes a missing file from an unsafe object or I/O error. `storage_atomic_write()` writes at most 16 MiB to a same-directory temporary file created exclusively with mode `0600`, flushes and closes it, revalidates any destination, renames it atomically, and synchronizes the directory. Existing files must be regular files owned by the effective user with exact mode `0600` and one hard link. Files are addressed relative to retained directory descriptors with `openat()` and related APIs; public filenames are limited to 1–128 ASCII bytes, must start with an alphanumeric character, and may otherwise contain only alphanumerics, `.`, `_`, and `-`. This prevents path separators and traversal components. Future vault code must use application-generated user IDs for filenames and pass only metadata or already-encrypted vault bytes to this module.
+
+On macOS, file flushing uses `F_FULLFSYNC` when supported and falls back to `fsync()`. Some macOS filesystems do not support directory `fsync()`; `EINVAL` and `ENOTSUP` are treated as the platform's best available behavior. Linux uses `fsync()` for files and directories. The module checks POSIX mode bits and ownership but does not inspect platform-specific ACLs, extended attributes, or network-filesystem atomicity guarantees.
+
 ## Planned interface
 
 ```text
@@ -170,7 +178,7 @@ An OpenSSL probe checks both headers and the loaded library for major version 3.
 
 The smoke test checks seven CLI cases: `--help`, `-h`, no arguments, an unknown option, extra arguments, an unimplemented command, and an empty argument. It checks output and exit status, not vault security or authentication.
 
-`make test` also runs unit tests for deterministic scrypt derivation, salt separation, HKDF key separation and repeatability, AES-GCM round trips and authentication failures, verifier creation and checking, VMK protection and AAD binding, buffer boundaries, invalid inputs, and failure cleanup. HKDF is checked against [RFC 5869 Appendix A, cases 1 and 3](https://www.rfc-editor.org/rfc/rfc5869#appendix-A), and AES-GCM decryption uses a published AES-256-GCM known-answer vector. Tests use dummy data and never print key bytes. Production-cost scrypt is exercised; only input-boundary tests use smaller costs. These tests do not constitute a security audit or a benchmark of password-guessing resistance.
+`make test` also runs unit tests for deterministic scrypt derivation, salt separation, HKDF key separation and repeatability, AES-GCM round trips and authentication failures, verifier creation and checking, VMK protection and AAD binding, and secure filesystem behavior. Storage tests use an isolated temporary `HOME` and cover permissions, bounded reads, atomic replacement, unsafe objects, symlinks, oversized files, missing files, and failed-write cleanup. HKDF is checked against [RFC 5869 Appendix A, cases 1 and 3](https://www.rfc-editor.org/rfc/rfc5869#appendix-A), and AES-GCM decryption uses a published AES-256-GCM known-answer vector. Tests use dummy data and never print key bytes. Production-cost scrypt is exercised; only input-boundary tests use smaller costs. These tests do not constitute a security audit or a benchmark of password-guessing resistance.
 
 Clean build files:
 
@@ -192,13 +200,16 @@ make clean
 │   ├── auth.c              # verifier and VMK protection primitives
 │   ├── auth.h
 │   ├── crypto.c            # randomness and key derivation
-│   └── crypto.h
+│   ├── crypto.h
+│   ├── storage.c           # secure filesystem operations
+│   └── storage.h
 ├── tools/
 │   └── check_openssl.c     # build dependency/version probe
 └── tests/
     ├── smoke.sh           # CLI integration smoke test
     ├── test_auth.c        # authentication and VMK unit tests
-    └── test_crypto.c      # cryptographic unit tests
+    ├── test_crypto.c      # cryptographic unit tests
+    └── test_storage.c     # storage unit tests
 ```
 
 Objects and generated header dependencies go in the ignored `build/` directory. The executable remains `securepm`.
@@ -208,7 +219,6 @@ Add implementation/header pairs under `src/` as each feature is developed:
 | Module | Responsibility |
 | --- | --- |
 | `input.c` / `input.h` | Bounded interactive input and terminal echo control |
-| `storage.c` / `storage.h` | Vault file I/O, permissions, and safe replacement |
 | `serialization.c` / `serialization.h` | Vault encoding, decoding, and format validation |
 | `vault.c` / `vault.h` | Credential operations and coordination of storage and cryptography |
 
