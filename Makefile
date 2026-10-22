@@ -1,6 +1,7 @@
 CC ?= cc
 CFLAGS ?= -Wall -Wextra -Wpedantic -Wformat=2 -Wformat-security
 PKG_CONFIG ?= pkg-config
+PTY_LIBS ?= $(if $(filter Linux,$(shell uname -s)),-lutil,)
 
 # Prefer pkg-config; Homebrew OpenSSL is outside macOS's default search path.
 OPENSSL_PREFIX ?= $(shell command -v brew >/dev/null 2>&1 && brew --prefix openssl@3 2>/dev/null)
@@ -15,12 +16,12 @@ endif
 OPENSSL_LIBS ?= -lcrypto
 
 TARGET = securepm
-SRC = src/main.c src/cli.c src/crypto.c src/auth.c src/storage.c src/user_db.c \
-	src/account.c src/vault.c src/credentials.c
+SRC = src/main.c src/cli.c src/input.c src/crypto.c src/auth.c src/storage.c \
+	src/user_db.c src/account.c src/vault.c src/credentials.c
 OBJ = $(SRC:src/%.c=build/%.o)
 DEP = $(OBJ:.o=.d) build/test_crypto.d build/test_auth.d build/test_storage.d \
 	build/test_user_db.d build/test_account.d build/test_vault.d \
-	build/test_credentials.d
+	build/test_credentials.d build/test_cli.d
 
 .PHONY: all clean test check-openssl
 all: $(TARGET)
@@ -87,9 +88,15 @@ build/test_credentials: build/test_credentials.o build/credentials.o \
 		build/auth.o build/crypto.o | check-openssl
 	$(CC) $(LDFLAGS) $^ $(OPENSSL_LIBS) $(LDLIBS) -o $@
 
+build/test_cli.o: tests/test_cli.c | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
+
+build/test_cli: build/test_cli.o
+	$(CC) $(LDFLAGS) $^ $(PTY_LIBS) $(LDLIBS) -o $@
+
 test: $(TARGET) build/test_crypto build/test_auth build/test_storage \
 		build/test_user_db build/test_account build/test_vault \
-		build/test_credentials
+		build/test_credentials build/test_cli
 	sh tests/smoke.sh ./$(TARGET)
 	./build/test_crypto
 	./build/test_auth
@@ -98,6 +105,7 @@ test: $(TARGET) build/test_crypto build/test_auth build/test_storage \
 	./build/test_account
 	./build/test_vault
 	./build/test_credentials
+	./build/test_cli ./$(TARGET)
 
 clean:
 	rm -rf build

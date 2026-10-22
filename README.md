@@ -6,10 +6,9 @@ I originally selected the Secure File Manager project, but changed to **Secure P
 
 ## Current stage
 
-The **Checkpoint 1: threat model and architecture** design is preserved while preparing for **Checkpoint 2: core implementation**.
-The interface remains a CLI skeleton. The crypto module provides random bytes, scrypt root-key derivation, HKDF-SHA256 key separation, and AES-256-GCM authenticated encryption. The authentication module provides master-password verifier primitives and VMK protection. The storage and user database modules persist validated authentication metadata. The account module provides non-interactive registration, unlock, and session locking. The vault module persists opaque encrypted payloads, and the credentials module manages and serializes the records within those payloads. Password prompts and CLI account, credential, or vault commands are not implemented yet.
+The **Checkpoint 1: threat model and architecture** design is preserved in the **Checkpoint 2: core implementation**. The interactive CLI supports user creation, login, adding credentials, listing non-secret credential metadata, and locking. The crypto module provides random bytes, scrypt root-key derivation, HKDF-SHA256 key separation, and AES-256-GCM authenticated encryption. The authentication module provides master-password verifier primitives and VMK protection. The storage and user database modules persist validated authentication metadata. The account module provides registration, unlock, and session locking. The vault module persists encrypted payloads, and the credentials module manages and serializes the records within those payloads.
 
-The supplied Password Manager checkpoint requirements call for working vault storage, credentials encrypted at rest, master-password verification before unlocking, an interface that never prints plaintext passwords, clean-machine build instructions, incremental commits, and a short progress note. The cryptographic, account, encrypted-file, and credential-serialization foundations now exist, while the integrated interface and progress note remain pending. This is not yet a completed Checkpoint 2 submission. The File Manager encryption/decryption commands in the same sheet apply to the other project.
+The supplied Password Manager checkpoint requirements call for working vault storage, credentials encrypted at rest, master-password verification before unlocking, an interface that never prints plaintext passwords, clean-machine build instructions, incremental commits, and a short progress note. The cryptographic, account, encrypted-file, credential-serialization, and minimal interface foundations are implemented. The File Manager encryption/decryption commands in the same sheet apply to the other project.
 
 ## Project scope
 
@@ -132,7 +131,7 @@ The database intentionally contains password-verification material and an encryp
 
 `account_unlock()` returns one generic success/failure result. It clears the supplied session before attempting a load, lookup, or derivation; validates the verifier before unwrapping the VMK; and publishes the user ID and VMK only after GCM authentication succeeds. `account_session_lock()` securely clears the VMK and resets the session. Root keys are cleared immediately after key separation, and temporary authentication keys, KEKs, and VMKs are cleared as soon as they are no longer needed and again on cleanup paths.
 
-The current account layer has no password-strength policy beyond the cryptographic length bounds, no retry throttling, and no multi-process registration lock. A future CLI should present generic unlock errors and add rate limiting. Concurrent read-modify-save registrations can overwrite each other until storage-level coordination is added.
+The current account layer has no password-strength policy beyond the cryptographic length bounds, no retry throttling, and no multi-process registration lock. The CLI presents generic login errors, but rate limiting is not implemented. Concurrent read-modify-save registrations can overwrite each other until storage-level coordination is added.
 
 ## Encrypted vault persistence
 
@@ -150,7 +149,9 @@ The version 1 serialized payload starts with the 8 ASCII bytes `SPMCREDS`, follo
 
 Serialized credential payloads remain plaintext until passed to `vault_write()` and must never be given directly to the storage API. `credentials_serialized_free()` clears and frees such buffers, while `credentials_cleanup()` clears a complete collection, including password storage. The process does not use locked memory, so operating-system swapping and privileged process inspection remain outside this module's protection.
 
-## Planned interface
+## Interactive use
+
+Run the application without arguments from a terminal:
 
 ```text
 $ ./securepm
@@ -161,19 +162,15 @@ $ ./securepm
 
 After login:
 
-add
-list
-show <record-id>
-copy <record-id>
-update <record-id>
-delete <record-id>
-lock
-help
-exit
+1. Add credential
+2. List credentials
+3. Lock
+4. Exit
 ```
 
-Stored passwords will not be printed in cleartext.
-The planned `show` command must mask or omit passwords. Any future `copy` implementation must preserve the no-plaintext-output rule.
+Master passwords and credential passwords are read with terminal echo disabled and cannot be supplied as command-line arguments. Registration creates an explicitly encrypted empty vault. Login requires an existing valid vault and will not recreate a missing or corrupted one. Listing shows record IDs, labels, and usernames; stored passwords are never displayed.
+
+The current interface does not provide show, copy, update, delete, password generation, clipboard integration, password confirmation, or recovery. If user metadata is saved but initial encrypted-vault creation fails, registration is reported as incomplete; there is no user-record rollback operation yet. The terminal interface requires a POSIX pseudo-terminal or real terminal, and sensitive process memory is cleared when released but is not locked against swapping.
 
 ## Build
 
@@ -208,9 +205,9 @@ make OPENSSL_CFLAGS='-I/opt/openssl/include' OPENSSL_LIBS='-L/opt/openssl/lib -l
 
 An OpenSSL probe checks both headers and the loaded library for major version 3. Missing or incompatible dependencies fail the build; cryptography is not silently disabled. Clean before changing compilers or dependency flags. Standard `CPPFLAGS`, `CFLAGS`, `LDFLAGS`, and `LDLIBS` are also supported; C17 is always enabled.
 
-The smoke test checks seven CLI cases: `--help`, `-h`, no arguments, an unknown option, extra arguments, an unimplemented command, and an empty argument. It checks output and exit status, not vault security or authentication.
+The smoke test checks seven CLI cases: `--help`, `-h`, non-terminal interactive use, an unknown option, extra arguments, an unsupported command-line command, and an empty argument.
 
-`make test` also runs unit tests for deterministic scrypt derivation, salt separation, HKDF key separation and repeatability, AES-GCM round trips and authentication failures, verifier creation and checking, VMK protection and AAD binding, secure filesystem behavior, user database persistence, account registration/unlock, encrypted vault persistence, and credential serialization. Filesystem-facing tests use isolated temporary `HOME` directories. Vault tests cover empty and nonempty payloads, reopen persistence, filename derivation, atomic replacement, permissions, missing files, locked sessions, wrong users and keys, authenticated-header changes, corruption, truncation, invalid lengths, and trailing data. Credential tests cover empty and maximum-size collections, binary passwords, stable IDs, malformed encodings, secure cleanup, and an account-to-encrypted-vault integration round trip. HKDF is checked against [RFC 5869 Appendix A, cases 1 and 3](https://www.rfc-editor.org/rfc/rfc5869#appendix-A), and AES-GCM decryption uses a published AES-256-GCM known-answer vector. Tests use dummy data and never print key bytes. Production-cost scrypt is exercised; only input-boundary tests use smaller costs. These tests do not constitute a security audit or a benchmark of password-guessing resistance.
+`make test` also runs unit tests for deterministic scrypt derivation, salt separation, HKDF key separation and repeatability, AES-GCM round trips and authentication failures, verifier creation and checking, VMK protection and AAD binding, secure filesystem behavior, user database persistence, account registration/unlock, encrypted vault persistence, and credential serialization. Filesystem-facing tests use isolated temporary `HOME` directories. Vault tests cover empty and nonempty payloads, reopen persistence, filename derivation, atomic replacement, permissions, missing files, locked sessions, wrong users and keys, authenticated-header changes, corruption, truncation, invalid lengths, and trailing data. Credential tests cover empty and maximum-size collections, binary passwords, stable IDs, malformed encodings, secure cleanup, and an account-to-encrypted-vault integration round trip. A pseudo-terminal test exercises registration, hidden password input, wrong-password rejection, adding, locking, restart persistence, listing without passwords, missing and corrupted vault rejection, bounded input, and terminal restoration after `SIGINT`. HKDF is checked against [RFC 5869 Appendix A, cases 1 and 3](https://www.rfc-editor.org/rfc/rfc5869#appendix-A), and AES-GCM decryption uses a published AES-256-GCM known-answer vector. Tests use dummy data and never print key bytes. Production-cost scrypt is exercised; only input-boundary tests use smaller costs. These tests do not constitute a security audit or a benchmark of password-guessing resistance.
 
 Clean build files:
 
@@ -227,8 +224,10 @@ make clean
 ├── .gitignore
 ├── src/
 │   ├── main.c              # program entry point
-│   ├── cli.c               # help and argument dispatch
+│   ├── cli.c               # interactive workflow and argument dispatch
 │   ├── cli.h
+│   ├── input.c             # bounded terminal input and echo control
+│   ├── input.h
 │   ├── auth.c              # verifier and VMK protection primitives
 │   ├── auth.h
 │   ├── account.c           # registration, unlock, and session locking
@@ -249,6 +248,7 @@ make clean
     ├── smoke.sh           # CLI integration smoke test
     ├── test_account.c     # account integration tests
     ├── test_auth.c        # authentication and VMK unit tests
+    ├── test_cli.c         # pseudo-terminal end-to-end CLI tests
     ├── test_credentials.c # credential serialization and vault integration tests
     ├── test_crypto.c      # cryptographic unit tests
     ├── test_storage.c     # storage unit tests
@@ -258,10 +258,4 @@ make clean
 
 Objects and generated header dependencies go in the ignored `build/` directory. The executable remains `securepm`.
 
-Add implementation/header pairs under `src/` as each feature is developed:
-
-| Module | Responsibility |
-| --- | --- |
-| `input.c` / `input.h` | Bounded interactive input and terminal echo control |
-
-These are planned boundaries, not implemented APIs. Further unit tests and integration tests will live under `tests/` alongside the current tests. No empty module implementations are included.
+Further unit tests and integration tests live under `tests/` alongside the current tests. No empty module implementations are included.

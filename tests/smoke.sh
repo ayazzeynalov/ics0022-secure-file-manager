@@ -14,17 +14,17 @@ fail() {
 "$program" --help >"$test_dir/help" 2>"$test_dir/err"
 test ! -s "$test_dir/err" || fail 'help wrote to stderr'
 grep -F 'Usage:' "$test_dir/help" >/dev/null || fail 'missing usage'
-grep -F 'Planned commands after login:' "$test_dir/help" >/dev/null || fail 'missing planned-command label'
+grep -F 'Passwords are read interactively' "$test_dir/help" >/dev/null || fail 'missing password-input guidance'
 
-for option in none short; do
-    if [ "$option" = none ]; then
-        "$program" >"$test_dir/out" 2>"$test_dir/err"
-    else
-        "$program" -h >"$test_dir/out" 2>"$test_dir/err"
-    fi
-    cmp -s "$test_dir/help" "$test_dir/out" || fail 'inconsistent help output'
-    test ! -s "$test_dir/err" || fail 'help wrote to stderr'
-done
+"$program" -h >"$test_dir/out" 2>"$test_dir/err"
+cmp -s "$test_dir/help" "$test_dir/out" || fail 'inconsistent help output'
+test ! -s "$test_dir/err" || fail 'help wrote to stderr'
+
+status=0
+"$program" >"$test_dir/out" 2>"$test_dir/err" || status=$?
+test "$status" -eq 1 || fail 'non-terminal interactive use must fail'
+test ! -s "$test_dir/out" || fail 'non-terminal use wrote to stdout'
+grep -Fx 'Interactive terminal required.' "$test_dir/err" >/dev/null || fail 'missing terminal requirement'
 
 check_rejected() {
     status=0
