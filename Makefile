@@ -16,10 +16,10 @@ OPENSSL_LIBS ?= -lcrypto
 
 TARGET = securepm
 SRC = src/main.c src/cli.c src/crypto.c src/auth.c src/storage.c src/user_db.c \
-	src/account.c
+	src/account.c src/vault.c
 OBJ = $(SRC:src/%.c=build/%.o)
 DEP = $(OBJ:.o=.d) build/test_crypto.d build/test_auth.d build/test_storage.d \
-	build/test_user_db.d build/test_account.d
+	build/test_user_db.d build/test_account.d build/test_vault.d
 
 .PHONY: all clean test check-openssl
 all: $(TARGET)
@@ -71,14 +71,22 @@ build/test_account: build/test_account.o build/account.o build/user_db.o \
 		build/storage.o build/auth.o build/crypto.o | check-openssl
 	$(CC) $(LDFLAGS) $^ $(OPENSSL_LIBS) $(LDLIBS) -o $@
 
+build/test_vault.o: tests/test_vault.c | build check-openssl
+	$(CC) $(CPPFLAGS) -Isrc $(OPENSSL_CFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
+
+build/test_vault: build/test_vault.o build/vault.o build/storage.o \
+		build/crypto.o build/account.o build/user_db.o build/auth.o | check-openssl
+	$(CC) $(LDFLAGS) $^ $(OPENSSL_LIBS) $(LDLIBS) -o $@
+
 test: $(TARGET) build/test_crypto build/test_auth build/test_storage \
-		build/test_user_db build/test_account
+		build/test_user_db build/test_account build/test_vault
 	sh tests/smoke.sh ./$(TARGET)
 	./build/test_crypto
 	./build/test_auth
 	./build/test_storage
 	./build/test_user_db
 	./build/test_account
+	./build/test_vault
 
 clean:
 	rm -rf build

@@ -7,9 +7,9 @@ I originally selected the Secure File Manager project, but changed to **Secure P
 ## Current stage
 
 The **Checkpoint 1: threat model and architecture** design is preserved while preparing for **Checkpoint 2: core implementation**.
-The interface remains a CLI skeleton. The crypto module provides random bytes, scrypt root-key derivation, HKDF-SHA256 key separation, and AES-256-GCM authenticated encryption. The authentication module provides master-password verifier primitives and VMK protection. The storage and user database modules persist validated authentication metadata. The account module provides non-interactive registration, unlock, and session locking. Password prompts, encrypted vault serialization, and CLI account commands are not implemented yet.
+The interface remains a CLI skeleton. The crypto module provides random bytes, scrypt root-key derivation, HKDF-SHA256 key separation, and AES-256-GCM authenticated encryption. The authentication module provides master-password verifier primitives and VMK protection. The storage and user database modules persist validated authentication metadata. The account module provides non-interactive registration, unlock, and session locking. The vault module persists opaque encrypted payloads. Password prompts, credential serialization, and CLI account or vault commands are not implemented yet.
 
-The supplied Password Manager checkpoint requirements call for working vault storage, credentials encrypted at rest, master-password verification before unlocking, an interface that never prints plaintext passwords, clean-machine build instructions, incremental commits, and a short progress note. These functional requirements remain pending; this setup is not a completed Checkpoint 2 submission. The File Manager encryption/decryption commands in the same sheet apply to the other project.
+The supplied Password Manager checkpoint requirements call for working vault storage, credentials encrypted at rest, master-password verification before unlocking, an interface that never prints plaintext passwords, clean-machine build instructions, incremental commits, and a short progress note. The cryptographic, account, and encrypted-file foundations now exist, while credential serialization and operations, the integrated interface, and the progress note remain pending. This is not yet a completed Checkpoint 2 submission. The File Manager encryption/decryption commands in the same sheet apply to the other project.
 
 ## Project scope
 
@@ -114,7 +114,7 @@ Thus the AAD length is `23 + user_id_length`. The user database persists the for
 
 `src/storage.h` provides a crypto-independent storage context for the application root and vault directory. `storage_init()` opens the absolute `HOME` path one component at a time without following symlinks, verifies that `HOME` belongs to the effective user, and creates or validates `~/.securepm/` and `~/.securepm/vaults/` with mode `0700`. Existing directories with the wrong owner, type, or permissions are rejected.
 
-`storage_read_file()` performs bounded reads and distinguishes a missing file from an unsafe object or I/O error. `storage_atomic_write()` writes at most 16 MiB to a same-directory temporary file created exclusively with mode `0600`, flushes and closes it, revalidates any destination, renames it atomically, and synchronizes the directory. Existing files must be regular files owned by the effective user with exact mode `0600` and one hard link. Files are addressed relative to retained directory descriptors with `openat()` and related APIs; public filenames are limited to 1–128 ASCII bytes, must start with an alphanumeric character, and may otherwise contain only alphanumerics, `.`, `_`, and `-`. This prevents path separators and traversal components. Future vault code must use application-generated user IDs for filenames and pass only metadata or already-encrypted vault bytes to this module.
+`storage_read_file()` performs bounded reads and distinguishes a missing file from an unsafe object or I/O error. `storage_atomic_write()` writes at most 16 MiB to a same-directory temporary file created exclusively with mode `0600`, flushes and closes it, revalidates any destination, renames it atomically, and synchronizes the directory. Existing files must be regular files owned by the effective user with exact mode `0600` and one hard link. Files are addressed relative to retained directory descriptors with `openat()` and related APIs; public filenames are limited to 1–128 ASCII bytes, must start with an alphanumeric character, and may otherwise contain only alphanumerics, `.`, `_`, and `-`. This prevents path separators and traversal components. Vault filenames use application-generated user IDs and the storage module receives only encrypted vault bytes.
 
 On macOS, file flushing uses `F_FULLFSYNC` when supported and falls back to `fsync()`. Some macOS filesystems do not support directory `fsync()`; `EINVAL` and `ENOTSUP` are treated as the platform's best available behavior. Linux uses `fsync()` for files and directories. The module checks POSIX mode bits and ownership but does not inspect platform-specific ACLs, extended attributes, or network-filesystem atomicity guarantees.
 
@@ -133,6 +133,14 @@ The database intentionally contains password-verification material and an encryp
 `account_unlock()` returns one generic success/failure result. It clears the supplied session before attempting a load, lookup, or derivation; validates the verifier before unwrapping the VMK; and publishes the user ID and VMK only after GCM authentication succeeds. `account_session_lock()` securely clears the VMK and resets the session. Root keys are cleared immediately after key separation, and temporary authentication keys, KEKs, and VMKs are cleared as soon as they are no longer needed and again on cleanup paths.
 
 The current account layer has no password-strength policy beyond the cryptographic length bounds, no retry throttling, and no multi-process registration lock. A future CLI should present generic unlock errors and add rate limiting. Concurrent read-modify-save registrations can overwrite each other until storage-level coordination is added.
+
+## Encrypted vault persistence
+
+`src/vault.h` stores opaque payloads of 0–1 MiB under the unlocked session's VMK. Every operation requires `session->unlocked == 1`. The filename is the session's 16-byte application-generated user ID encoded as 32 lowercase hexadecimal characters followed by `.vault`; usernames never enter filesystem paths. A missing vault returns `VAULT_READ_MISSING`, while malformed or unauthenticated files return `VAULT_READ_ERROR`. Empty payloads are explicitly encrypted and stored rather than inferred from a missing file.
+
+The version 1 file format is: 8 ASCII magic bytes `SPMVAULT`, a 32-bit big-endian version, the 16-byte user ID, a 32-bit big-endian ciphertext length, a fresh 12-byte nonce, ciphertext of the encoded length, and a 16-byte GCM tag. The first 32 bytes—magic, version, user ID, and length—are passed byte-for-byte as AAD. The nonce is the GCM IV, so changing it also makes tag verification fail. The total file length is exactly `60 + ciphertext_length`; truncation and trailing data are rejected.
+
+`vault_write()` encrypts before using `storage_atomic_write()`. `vault_read()` uses the bounded storage read and publishes plaintext only after all structural checks and GCM authentication succeed. Callers must release returned plaintext with `vault_secure_free()` and the exact returned length. The format does not prevent deletion or rollback to an older otherwise valid encrypted vault, and concurrent writers are not coordinated yet.
 
 ## Planned interface
 
@@ -194,7 +202,7 @@ An OpenSSL probe checks both headers and the loaded library for major version 3.
 
 The smoke test checks seven CLI cases: `--help`, `-h`, no arguments, an unknown option, extra arguments, an unimplemented command, and an empty argument. It checks output and exit status, not vault security or authentication.
 
-`make test` also runs unit tests for deterministic scrypt derivation, salt separation, HKDF key separation and repeatability, AES-GCM round trips and authentication failures, verifier creation and checking, VMK protection and AAD binding, secure filesystem behavior, user database persistence, and account registration/unlock. Filesystem-facing tests use isolated temporary `HOME` directories. Account tests cover separate storage instances, wrong passwords, duplicate and missing users, corrupted metadata, malformed databases, session clearing, and the absence of supplied passwords and plaintext VMKs on disk. HKDF is checked against [RFC 5869 Appendix A, cases 1 and 3](https://www.rfc-editor.org/rfc/rfc5869#appendix-A), and AES-GCM decryption uses a published AES-256-GCM known-answer vector. Tests use dummy data and never print key bytes. Production-cost scrypt is exercised; only input-boundary tests use smaller costs. These tests do not constitute a security audit or a benchmark of password-guessing resistance.
+`make test` also runs unit tests for deterministic scrypt derivation, salt separation, HKDF key separation and repeatability, AES-GCM round trips and authentication failures, verifier creation and checking, VMK protection and AAD binding, secure filesystem behavior, user database persistence, account registration/unlock, and encrypted vault persistence. Filesystem-facing tests use isolated temporary `HOME` directories. Vault tests cover empty and nonempty payloads, reopen persistence, filename derivation, atomic replacement, permissions, missing files, locked sessions, wrong users and keys, authenticated-header changes, corruption, truncation, invalid lengths, and trailing data. HKDF is checked against [RFC 5869 Appendix A, cases 1 and 3](https://www.rfc-editor.org/rfc/rfc5869#appendix-A), and AES-GCM decryption uses a published AES-256-GCM known-answer vector. Tests use dummy data and never print key bytes. Production-cost scrypt is exercised; only input-boundary tests use smaller costs. These tests do not constitute a security audit or a benchmark of password-guessing resistance.
 
 Clean build files:
 
@@ -222,7 +230,9 @@ make clean
 │   ├── storage.c           # secure filesystem operations
 │   ├── storage.h
 │   ├── user_db.c           # versioned user metadata persistence
-│   └── user_db.h
+│   ├── user_db.h
+│   ├── vault.c             # encrypted vault file persistence
+│   └── vault.h
 ├── tools/
 │   └── check_openssl.c     # build dependency/version probe
 └── tests/
@@ -231,7 +241,8 @@ make clean
     ├── test_auth.c        # authentication and VMK unit tests
     ├── test_crypto.c      # cryptographic unit tests
     ├── test_storage.c     # storage unit tests
-    └── test_user_db.c     # user database unit tests
+    ├── test_user_db.c     # user database unit tests
+    └── test_vault.c       # encrypted vault persistence tests
 ```
 
 Objects and generated header dependencies go in the ignored `build/` directory. The executable remains `securepm`.
@@ -242,6 +253,5 @@ Add implementation/header pairs under `src/` as each feature is developed:
 | --- | --- |
 | `input.c` / `input.h` | Bounded interactive input and terminal echo control |
 | `serialization.c` / `serialization.h` | Vault encoding, decoding, and format validation |
-| `vault.c` / `vault.h` | Credential operations and coordination of storage and cryptography |
 
 These are planned boundaries, not implemented APIs. Further unit tests and integration tests will live under `tests/` alongside the current tests. No empty module implementations are included.
