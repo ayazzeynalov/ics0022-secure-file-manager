@@ -9,10 +9,11 @@
 #define ACCOUNT_USER_ID_ATTEMPTS 128
 
 static int valid_credentials(const char *username, size_t username_length,
-                             const char *password, size_t password_length)
+                             const char *password, size_t password_length,
+                             size_t minimum_password_length)
 {
     return user_db_username_valid(username, username_length) &&
-           password != NULL && password_length > 0 &&
+           password != NULL && password_length >= minimum_password_length &&
            password_length <= CRYPTO_PASSWORD_MAX_BYTES;
 }
 
@@ -57,8 +58,9 @@ int account_register(const struct storage *storage,
     user_db_init(&database);
     memset(&record, 0, sizeof(record));
     if (storage == NULL ||
-        !valid_credentials(username, username_length,
-                           master_password, password_length)) {
+        !valid_credentials(username, username_length, master_password,
+                           password_length,
+                           ACCOUNT_MASTER_PASSWORD_MIN_BYTES)) {
         errno = EINVAL;
         goto cleanup;
     }
@@ -134,8 +136,8 @@ int account_unlock(const struct storage *storage,
     account_session_lock(session);
     user_db_init(&database);
     if (storage == NULL ||
-        !valid_credentials(username, username_length,
-                           master_password, password_length)) {
+        !valid_credentials(username, username_length, master_password,
+                           password_length, 1)) {
         errno = EINVAL;
         goto cleanup;
     }

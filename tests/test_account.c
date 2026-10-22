@@ -133,8 +133,10 @@ static void test_invalid_inputs(const struct storage *storage,
     unsigned char *data = NULL;
     size_t data_length = 0;
     char oversized_password[CRYPTO_PASSWORD_MAX_BYTES + 1];
+    char short_password[ACCOUNT_MASTER_PASSWORD_MIN_BYTES - 1];
 
     memset(oversized_password, 'p', sizeof(oversized_password));
+    memset(short_password, 'p', sizeof(short_password));
     memset(&session, 0xa5, sizeof(session));
 
     CHECK(account_register(NULL, "Alice", 5,
@@ -144,6 +146,8 @@ static void test_invalid_inputs(const struct storage *storage,
     CHECK(account_register(storage, "Alice", 5, NULL,
                            password_length) == 0);
     CHECK(account_register(storage, "Alice", 5, password, 0) == 0);
+    CHECK(account_register(storage, "Alice", 5, short_password,
+                           sizeof(short_password)) == 0);
     CHECK(account_register(storage, "Alice", 5, oversized_password,
                            sizeof(oversized_password)) == 0);
     CHECK(storage_read_file(storage, STORAGE_AREA_ROOT, USER_DB_FILENAME,
@@ -156,7 +160,65 @@ static void test_invalid_inputs(const struct storage *storage,
                          &session) == 0);
     check_locked(&session);
     account_session_lock(NULL);
+    OPENSSL_cleanse(short_password, sizeof(short_password));
     OPENSSL_cleanse(oversized_password, sizeof(oversized_password));
+}
+
+static void test_legacy_short_password(const struct storage *storage,
+                                       struct account_session *session)
+{
+    char password[] = "old-pass-1";
+    struct user_database database;
+    struct user_record record = {0};
+    struct crypto_keys keys = {0};
+    unsigned char root[CRYPTO_KEY_BYTES] = {0};
+    unsigned char vmk[AUTH_VMK_BYTES] = {0};
+    int prepared;
+
+    CHECK(sizeof(password) - 1 < ACCOUNT_MASTER_PASSWORD_MIN_BYTES);
+    user_db_init(&database);
+    CHECK(user_db_load(storage, &database) == 1);
+    record.format_version = USER_DB_RECORD_VERSION;
+    memcpy(record.username, "Legacy", sizeof("Legacy"));
+    record.scrypt = crypto_scrypt_defaults;
+    for (size_t index = 0; index < sizeof(record.user_id); ++index) {
+        record.user_id[index] = (unsigned char)(0xd0 + index);
+    }
+    for (size_t index = 0; index < sizeof(record.salt); ++index) {
+        record.salt[index] = (unsigned char)(0x70 + index);
+    }
+    prepared = crypto_derive_root(password, sizeof(password) - 1,
+                                  record.salt, sizeof(record.salt),
+                                  &record.scrypt, root, sizeof(root)) &&
+               crypto_derive_keys(root, sizeof(root), &keys) &&
+               auth_create_verifier(
+                   keys.authentication, sizeof(keys.authentication),
+                   record.authentication_verifier,
+                   sizeof(record.authentication_verifier)) &&
+               auth_generate_wrapped_vmk(
+                   keys.kek, sizeof(keys.kek),
+                   record.user_id, sizeof(record.user_id),
+                   record.format_version,
+                   vmk, sizeof(vmk),
+                   record.wrapped_vmk, sizeof(record.wrapped_vmk),
+                   record.vmk_nonce, sizeof(record.vmk_nonce),
+                   record.vmk_tag, sizeof(record.vmk_tag));
+    CHECK(prepared == 1);
+    if (prepared) {
+        CHECK(user_db_add(&database, &record) == 1);
+        CHECK(user_db_save(storage, &database) == 1);
+        CHECK(account_unlock(storage, "Legacy", 6,
+                             password, sizeof(password) - 1,
+                             session) == 1);
+        CHECK(session->unlocked == 1);
+        account_session_lock(session);
+        check_locked(session);
+    }
+    OPENSSL_cleanse(password, sizeof(password));
+    OPENSSL_cleanse(&record, sizeof(record));
+    OPENSSL_cleanse(&keys, sizeof(keys));
+    OPENSSL_cleanse(root, sizeof(root));
+    OPENSSL_cleanse(vmk, sizeof(vmk));
 }
 
 static void test_registration(const struct storage *storage,
@@ -328,13 +390,14 @@ int main(void)
     struct user_record alice_record = {0};
     struct account_session session = ACCOUNT_SESSION_INITIALIZER;
     char alice_password[] = "dummy-master-password-alpha";
-    char carol_password[] = "dummy-master-password-carol";
+    char carol_password[] = "dummy-pass12";
     char wrong_password[] = "dummy-wrong-password";
     const size_t alice_password_length = sizeof(alice_password) - 1;
     const size_t carol_password_length = sizeof(carol_password) - 1;
     const size_t wrong_password_length = sizeof(wrong_password) - 1;
     int home_set;
 
+    CHECK(carol_password_length == ACCOUNT_MASTER_PASSWORD_MIN_BYTES);
     CHECK(home != NULL);
     if (home == NULL) {
         return 1;
@@ -363,6 +426,7 @@ int main(void)
         test_corrupted_record(&storage,
                               alice_password, alice_password_length,
                               &alice_record, &session);
+        test_legacy_short_password(&storage, &session);
         test_session_lock(&session);
         test_malformed_database(&storage,
                                 alice_password, alice_password_length,

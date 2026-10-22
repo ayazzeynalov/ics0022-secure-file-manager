@@ -72,27 +72,13 @@ void input_cleanup(void)
     (void)restore_terminal();
 }
 
-static int discard_remainder(void)
-{
-    int byte;
-
-    do {
-        errno = 0;
-        byte = fgetc(stdin);
-        if (byte == EOF && ferror(stdin) && errno == EINTR) {
-            clearerr(stdin);
-            return INPUT_READ_INTERRUPTED;
-        }
-    } while (byte != '\n' && byte != EOF);
-    return interrupted_signal == 0 ? INPUT_READ_TOO_LONG :
-                                     INPUT_READ_INTERRUPTED;
-}
-
 static int read_line(const char *prompt, char *buffer, size_t capacity,
                      size_t *length)
 {
-    size_t used;
-    int next;
+    size_t used = 0;
+    int invalid = 0;
+    int too_long = 0;
+    int received_input = 0;
 
     if (prompt == NULL || buffer == NULL || capacity < 2 || length == NULL ||
         capacity > INT_MAX) {
@@ -107,41 +93,49 @@ static int read_line(const char *prompt, char *buffer, size_t capacity,
     if (fputs(prompt, stdout) == EOF || fflush(stdout) == EOF) {
         return INPUT_READ_ERROR;
     }
-    errno = 0;
-    if (fgets(buffer, (int)capacity, stdin) == NULL) {
-        if (interrupted_signal != 0 || (ferror(stdin) && errno == EINTR)) {
-            clearerr(stdin);
-            return INPUT_READ_INTERRUPTED;
-        }
-        return feof(stdin) ? INPUT_READ_EOF : INPUT_READ_ERROR;
-    }
-    used = strlen(buffer);
-    if (used != 0 && buffer[used - 1] == '\n') {
-        buffer[--used] = '\0';
-        if (used != 0 && buffer[used - 1] == '\r') {
-            buffer[--used] = '\0';
-        }
-        *length = used;
-        return INPUT_READ_OK;
-    }
-    if (used < capacity - 1) {
-        *length = used;
-        return INPUT_READ_OK;
-    }
-    errno = 0;
-    next = fgetc(stdin);
-    if (next == '\n' || next == EOF) {
-        if (next == EOF && ferror(stdin)) {
-            if (errno == EINTR || interrupted_signal != 0) {
+    while (1) {
+        int byte;
+
+        errno = 0;
+        byte = fgetc(stdin);
+        if (byte == EOF) {
+            if (interrupted_signal != 0 ||
+                (ferror(stdin) && errno == EINTR)) {
                 clearerr(stdin);
                 return INPUT_READ_INTERRUPTED;
             }
-            return INPUT_READ_ERROR;
+            if (ferror(stdin)) {
+                return INPUT_READ_ERROR;
+            }
+            if (!received_input) {
+                return INPUT_READ_EOF;
+            }
+            break;
         }
-        *length = used;
-        return INPUT_READ_OK;
+        received_input = 1;
+        if (byte == '\n') {
+            break;
+        }
+        if (byte == '\0') {
+            invalid = 1;
+            continue;
+        }
+        if (used < capacity - 1) {
+            buffer[used++] = (char)(unsigned char)byte;
+        } else {
+            too_long = 1;
+        }
     }
-    return discard_remainder();
+    if (used != 0 && buffer[used - 1] == '\r') {
+        --used;
+    }
+    buffer[used] = '\0';
+    if (invalid || too_long) {
+        buffer[0] = '\0';
+        return invalid ? INPUT_READ_INVALID : INPUT_READ_TOO_LONG;
+    }
+    *length = used;
+    return INPUT_READ_OK;
 }
 
 int input_read_line(const char *prompt, char *buffer, size_t capacity,

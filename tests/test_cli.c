@@ -204,13 +204,13 @@ static int wait_for_text(int master, struct transcript *transcript,
     return 0;
 }
 
-static int write_all(int descriptor, const char *text)
+static int write_bytes(int descriptor, const void *data, size_t length)
 {
-    size_t length = strlen(text);
+    const unsigned char *bytes = data;
     size_t offset = 0;
 
     while (offset < length) {
-        ssize_t written = write(descriptor, text + offset, length - offset);
+        ssize_t written = write(descriptor, bytes + offset, length - offset);
 
         if (written > 0) {
             offset += (size_t)written;
@@ -221,6 +221,11 @@ static int write_all(int descriptor, const char *text)
         }
     }
     return 1;
+}
+
+static int write_all(int descriptor, const char *text)
+{
+    return write_bytes(descriptor, text, strlen(text));
 }
 
 static pid_t start_program(const char *program, const char *home, int *master)
@@ -438,6 +443,45 @@ static void test_eof_at_secret(const char *program, const char *home)
     close(master);
 }
 
+static void test_embedded_nul(const char *program, const char *home)
+{
+    static const unsigned char invalid_username[] = {
+        'N', 'u', 'l', '\0', 'U', 's', 'e', 'r', '\n'
+    };
+    static const unsigned char invalid_password[] = {
+        's', 'e', 'c', 'r', 'e', 't', '\0', 'x', '\n'
+    };
+    struct transcript transcript = {{0}, 0, 0};
+    struct termios terminal;
+    int master = -1;
+    int status = 0;
+    pid_t child = start_program(program, home, &master);
+
+    CHECK(child > 0);
+    if (child <= 0) {
+        return;
+    }
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(write_all(master, "1\n"));
+    CHECK(wait_for_text(master, &transcript, "Username: "));
+    CHECK(write_bytes(master, invalid_username, sizeof(invalid_username)));
+    CHECK(wait_for_text(master, &transcript, "Invalid input."));
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(write_all(master, "1\n"));
+    CHECK(wait_for_text(master, &transcript, "Username: "));
+    CHECK(write_all(master, "NulUser\n"));
+    CHECK(wait_for_text(master, &transcript, "Master password: "));
+    CHECK(write_bytes(master, invalid_password, sizeof(invalid_password)));
+    CHECK(wait_for_text(master, &transcript, "Invalid input."));
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(write_all(master, "3\n"));
+    CHECK(wait_for_exit(child, master, &status));
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(tcgetattr(master, &terminal) == 0);
+    CHECK((terminal.c_lflag & ECHO) != 0);
+    close(master);
+}
+
 static void test_registration_vault_failure(const char *program)
 {
     static const char password[] = "dummy-incomplete-registration-password";
@@ -477,6 +521,10 @@ static void test_registration_vault_failure(const char *program)
                   write_all(master,
                             "dummy-incomplete-registration-password\n") &&
                   wait_for_text(master, &transcript,
+                                "Confirm master password: ") &&
+                  write_all(master,
+                            "dummy-incomplete-registration-password\n") &&
+                  wait_for_text(master, &transcript,
                                 "Registration is incomplete.");
         CHECK(success);
     }
@@ -507,6 +555,7 @@ int main(int argc, char *argv[])
     static const char master_password[] = "dummy-master-password-42";
     static const char wrong_password[] = "dummy-wrong-password";
     static const char credential_password[] = "dummy-credential-secret-73";
+    static const char mismatch_password[] = "dummy-mismatch-password";
     static const struct dialog_step oversized_steps[] = {
         {"Choice: ", "1\n"},
         {"Username: ",
@@ -518,7 +567,24 @@ int main(int argc, char *argv[])
         {"Choice: ", "1\n"},
         {"Username: ", "Alice\n"},
         {"Master password: ", "dummy-master-password-42\n"},
+        {"Confirm master password: ", "dummy-master-password-42\n"},
         {"User created.", NULL},
+        {"Choice: ", "3\n"}
+    };
+    static const struct dialog_step mismatch_steps[] = {
+        {"Choice: ", "1\n"},
+        {"Username: ", "Mismatch\n"},
+        {"Master password: ", "dummy-mismatch-password\n"},
+        {"Confirm master password: ", "different-dummy-password\n"},
+        {"Master passwords do not match.", NULL},
+        {"Choice: ", "3\n"}
+    };
+    static const struct dialog_step short_password_steps[] = {
+        {"Choice: ", "1\n"},
+        {"Username: ", "TooShort\n"},
+        {"Master password: ", "short-pass1\n"},
+        {"Confirm master password: ", "short-pass1\n"},
+        {"Registration failed.", NULL},
         {"Choice: ", "3\n"}
     };
     static const struct dialog_step wrong_password_steps[] = {
@@ -585,6 +651,17 @@ int main(int argc, char *argv[])
 
     CHECK(run_dialog(program, home, oversized_steps,
                      sizeof(oversized_steps) / sizeof(oversized_steps[0]),
+                     &transcript));
+    test_embedded_nul(program, home);
+    CHECK(run_dialog(program, home, mismatch_steps,
+                     sizeof(mismatch_steps) / sizeof(mismatch_steps[0]),
+                     &transcript));
+    CHECK(!contains_bytes(transcript.data, transcript.length,
+                          (const unsigned char *)mismatch_password,
+                          sizeof(mismatch_password) - 1));
+    CHECK(run_dialog(program, home, short_password_steps,
+                     sizeof(short_password_steps) /
+                         sizeof(short_password_steps[0]),
                      &transcript));
     CHECK(run_dialog(program, home, register_steps,
                      sizeof(register_steps) / sizeof(register_steps[0]),

@@ -43,6 +43,10 @@ static int read_value(const char *prompt, char *buffer, size_t capacity,
         puts("Input too long.");
         return 0;
     }
+    if (result == INPUT_READ_INVALID) {
+        puts("Invalid input.");
+        return 0;
+    }
     return -1;
 }
 
@@ -69,14 +73,17 @@ static int register_user(const struct storage *storage)
 {
     char username[USER_DB_USERNAME_MAX_BYTES + 1];
     char password[CRYPTO_PASSWORD_MAX_BYTES + 1];
+    char confirmation[CRYPTO_PASSWORD_MAX_BYTES + 1];
     struct account_session session = ACCOUNT_SESSION_INITIALIZER;
     struct credential_collection *empty = NULL;
     size_t username_length = 0;
     size_t password_length = 0;
+    size_t confirmation_length = 0;
     int read_result;
     int action = ACTION_CONTINUE;
 
     memset(password, 0, sizeof(password));
+    memset(confirmation, 0, sizeof(confirmation));
     read_result = read_value("Username: ", username, sizeof(username),
                              &username_length, 0);
     if (read_result <= 0) {
@@ -89,6 +96,19 @@ static int register_user(const struct storage *storage)
         action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
         goto cleanup;
     }
+    read_result = read_value("Confirm master password: ", confirmation,
+                             sizeof(confirmation), &confirmation_length, 1);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        goto cleanup;
+    }
+    if (password_length != confirmation_length ||
+        CRYPTO_memcmp(password, confirmation, password_length) != 0) {
+        puts("Master passwords do not match.");
+        goto cleanup;
+    }
+    OPENSSL_cleanse(confirmation, sizeof(confirmation));
+    confirmation_length = 0;
     if (!account_register(storage, username, username_length,
                           password, password_length)) {
         puts("Registration failed.");
@@ -110,6 +130,7 @@ static int register_user(const struct storage *storage)
 
 cleanup:
     OPENSSL_cleanse(password, sizeof(password));
+    OPENSSL_cleanse(confirmation, sizeof(confirmation));
     OPENSSL_cleanse(username, sizeof(username));
     if (empty != NULL) {
         credentials_cleanup(empty);

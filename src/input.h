@@ -8,6 +8,7 @@
 #define INPUT_READ_OK 1
 #define INPUT_READ_TOO_LONG 2
 #define INPUT_READ_INTERRUPTED 3
+#define INPUT_READ_INVALID 4
 
 int input_initialize(void);
 void input_cleanup(void);

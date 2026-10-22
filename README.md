@@ -127,7 +127,7 @@ The database intentionally contains password-verification material and an encryp
 
 ## Account registration and unlock
 
-`src/account.h` composes the existing modules without performing terminal input. `account_register()` accepts a validated username and an explicit 1–1024 byte password, rejects duplicate usernames, generates a unique random 16-byte user ID and random salt, derives the separated authentication key and KEK with the production scrypt profile, creates the verifier, wraps a random VMK, and atomically saves the resulting user record. The supplied password remains owned by the caller and is never persisted.
+`src/account.h` composes the existing modules without performing terminal input. `account_register()` accepts a validated username and an explicit 12–1024 byte password, rejects duplicate usernames, generates a unique random 16-byte user ID and random salt, derives the separated authentication key and KEK with the production scrypt profile, creates the verifier, wraps a random VMK, and atomically saves the resulting user record. Unlock still accepts shorter passwords so existing accounts remain compatible. The supplied password remains owned by the caller and is never persisted.
 
 `account_unlock()` returns one generic success/failure result. It clears the supplied session before attempting a load, lookup, or derivation; validates the verifier before unwrapping the VMK; and publishes the user ID and VMK only after GCM authentication succeeds. `account_session_lock()` securely clears the VMK and resets the session. Root keys are cleared immediately after key separation, and temporary authentication keys, KEKs, and VMKs are cleared as soon as they are no longer needed and again on cleanup paths.
 
@@ -168,9 +168,9 @@ After login:
 4. Exit
 ```
 
-Master passwords and credential passwords are read with terminal echo disabled and cannot be supplied as command-line arguments. Registration creates an explicitly encrypted empty vault. Login requires an existing valid vault and will not recreate a missing or corrupted one. Listing shows record IDs, labels, and usernames; stored passwords are never displayed.
+Master passwords and credential passwords are read with terminal echo disabled and cannot be supplied as command-line arguments. New master passwords must contain at least 12 bytes and are entered twice during registration. Registration creates an explicitly encrypted empty vault. Login requires an existing valid vault and will not recreate a missing or corrupted one. Listing shows record IDs, labels, and usernames; stored passwords are never displayed.
 
-The current interface does not provide show, copy, update, delete, password generation, clipboard integration, password confirmation, or recovery. If user metadata is saved but initial encrypted-vault creation fails, registration is reported as incomplete; there is no user-record rollback operation yet. The terminal interface requires a POSIX pseudo-terminal or real terminal, and sensitive process memory is cleared when released but is not locked against swapping.
+The current interface does not provide show, copy, update, delete, password generation, clipboard integration, or recovery. If user metadata is saved but initial encrypted-vault creation fails, registration is reported as incomplete; there is no user-record rollback operation yet. The terminal interface requires a POSIX pseudo-terminal or real terminal, and sensitive process memory is cleared when released but is not locked against swapping.
 
 ## Build
 
