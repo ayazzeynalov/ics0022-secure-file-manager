@@ -134,8 +134,8 @@ make OPENSSL_CFLAGS='-I/opt/openssl/include' \
      OPENSSL_LIBS='-L/opt/openssl/lib -lcrypto'
 ```
 
-The source is intended to build on macOS and Linux. The documented Checkpoint 2
-test runs were performed on macOS; Linux execution has not yet been verified.
+The application builds and all 2,292 tests pass on macOS and Ubuntu 24.04.5
+ARM64. The Linux run used GCC 13.3.0 and OpenSSL 3.0.13.
 
 ## Tests
 
