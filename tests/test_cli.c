@@ -2,7 +2,7 @@
 #define _DARWIN_C_SOURCE
 #include <util.h>
 #else
-#define _XOPEN_SOURCE 600
+#define _XOPEN_SOURCE 700
 #include <pty.h>
 #endif
 
