@@ -1,12 +1,12 @@
 # ICS0022 Secure Password Manager
 
-This is the Checkpoint 2 implementation of a local password manager for the
-ICS0022 Secure Programming course. It is written in C17 and uses OpenSSL 3.x
-and POSIX APIs.
+This repository contains the Checkpoint 2 implementation of a local password
+manager for the ICS0022 Secure Programming course. It is written in C17 and
+uses OpenSSL 3.x and POSIX APIs.
 
 ## Implemented features
 
-The current command-line application supports:
+The command-line application supports:
 
 - creating multiple local users;
 - logging in with a master password;
@@ -17,17 +17,13 @@ The current command-line application supports:
 - locking the active session; and
 - loading the same encrypted vault after restarting the program.
 
-User metadata is stored in `~/.securepm/users.db`. Each user has a separate
-vault under `~/.securepm/vaults/`, named from the application's random 16-byte
-user ID rather than the username. The user database, vault, and credential
-payload use versioned binary formats with explicit lengths and big-endian
-integers. Raw C structures are not written to disk.
-
-`users.db` contains the username, user ID, scrypt salt and parameters,
-authentication verifier, and encrypted Vault Master Key (VMK). Credential
-records are serialized and then encrypted before they are passed to the
-filesystem storage layer. Master passwords, derived keys, plaintext VMKs, and
-plaintext credential payloads are not persisted.
+User metadata is stored in `~/.securepm/users.db`. It includes the username,
+random user ID, scrypt parameters and salt, authentication verifier, and
+encrypted Vault Master Key (VMK). Each user has a separate encrypted vault
+under `~/.securepm/vaults/`, named from the random user ID rather than the
+username. The versioned binary formats use explicit lengths and big-endian
+integers instead of raw C structures. Master passwords, derived keys,
+plaintext VMKs, and plaintext credential payloads are not persisted.
 
 ## Interactive use
 
@@ -42,11 +38,10 @@ Secure Password Manager:
 3. Exit
 ```
 
-Registration asks for a username and master password. A new master password
-must be 12–1024 bytes and must be entered twice. Both entries are read with
-terminal echo disabled. After the entries match, the account metadata is
-created and an encrypted empty credential vault is initialized. Existing valid
-accounts with shorter passwords remain unlockable for compatibility.
+Registration asks for a username and a 12–1024 byte master password entered
+twice with terminal echo disabled. It then creates the account metadata and an
+encrypted empty credential vault. Existing valid accounts with shorter
+passwords remain unlockable.
 
 Login verifies the master password, unwraps the user's VMK, and decrypts the
 existing vault. A missing, malformed, or unauthenticated vault causes login to
@@ -62,10 +57,10 @@ Vault menu:
 4. Exit
 ```
 
-Adding a credential rewrites the encrypted vault atomically. Listing displays
-only the record ID, label, and username. Passwords are never accepted as
-command-line arguments or displayed by the list operation. Run
-`./securepm --help` for the command summary.
+Adding a credential rewrites the encrypted vault atomically. Listing shows only
+the record ID, label, and username. Passwords are not accepted as command-line
+arguments or displayed by the list operation. Run `./securepm --help` for the
+command summary.
 
 ## Security decisions
 
@@ -124,18 +119,16 @@ make clean && make
 make test
 ```
 
-The Makefile first uses `pkg-config` to locate `libcrypto`, then checks for a
-Homebrew OpenSSL installation on macOS, and otherwise uses the compiler's
-default search paths. A build-time probe rejects OpenSSL versions other than
-major version 3. Custom paths can be supplied explicitly:
+The Makefile uses `pkg-config` or Homebrew to locate OpenSSL and checks that
+major version 3 is in use. Custom paths can be supplied explicitly:
 
 ```bash
 make OPENSSL_CFLAGS='-I/opt/openssl/include' \
      OPENSSL_LIBS='-L/opt/openssl/lib -lcrypto'
 ```
 
-The application builds and all 2,292 tests pass on macOS and Ubuntu 24.04.5
-ARM64. The Linux run used GCC 13.3.0 and OpenSSL 3.0.13.
+The application builds and all 2,292 automated checks pass on macOS and Ubuntu
+24.04.5 ARM64. The Linux run used GCC 13.3.0 and OpenSSL 3.0.13.
 
 ## Tests
 
@@ -153,15 +146,13 @@ ARM64. The Linux run used GCC 13.3.0 and OpenSSL 3.0.13.
 
 Filesystem tests use isolated temporary `HOME` directories and dummy secrets.
 The test suite covers authentication failures, malformed and truncated files,
-atomic replacement, secure cleanup, and restart persistence. It is not a
-security audit or a benchmark of password-guessing resistance.
+atomic replacement, secure cleanup, and restart persistence.
 
 ## Remaining limitations and planned work
 
 Checkpoint 2 does not yet provide credential retrieval, update, or deletion.
 It also has no structured audit logging, login retry throttling, password
-generation, or clipboard integration. These features are planned after the
-current checkpoint.
+generation, or clipboard integration.
 
 There is no process-level file locking, so concurrent read-modify-write
 operations can overwrite each other. If user metadata is saved but initial
