@@ -25,6 +25,8 @@
 #define TEST_CIPHERTEXT_OFFSET 44
 #define TEST_FIXED_BYTES 60
 
+void storage_test_fail_atomic_sync_after(unsigned int writes);
+
 static unsigned int checks;
 static unsigned int failures;
 
@@ -412,6 +414,17 @@ static void test_file_format_and_replacement(
     storage_free(first_file);
 }
 
+static void test_committed_write_reconciliation(
+    const struct storage *storage,
+    const struct account_session *session)
+{
+    static const unsigned char payload[] = "committed after sync failure";
+
+    storage_test_fail_atomic_sync_after(1);
+    CHECK(vault_write(storage, session, payload, sizeof(payload) - 1) == 1);
+    check_round_trip(storage, session, payload, sizeof(payload) - 1);
+}
+
 static void test_empty_vault(const struct storage *storage)
 {
     struct account_session empty_session;
@@ -579,6 +592,7 @@ int main(void)
         test_write_read_and_reopen(&storage, &session);
         test_file_format_and_replacement(&storage, &session,
                                          &valid_file, &valid_file_length);
+        test_committed_write_reconciliation(&storage, &session);
         test_concurrent_updates(&storage, &session);
         test_empty_vault(&storage);
         if (valid_file != NULL) {

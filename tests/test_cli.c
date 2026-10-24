@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #define TEST_PATH_BYTES 4096
+#define TEST_RECORD_ID_BYTES 16
 #define TRANSCRIPT_BYTES (128U * 1024U)
 #define DIALOG_TIMEOUT_SECONDS 60
 
@@ -140,6 +141,35 @@ static int transcript_find(struct transcript *transcript,
          offset <= transcript->length - expected_length; ++offset) {
         if (memcmp(transcript->data + offset, expected, expected_length) == 0) {
             transcript->search_offset = offset + expected_length;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int extract_record_id(const struct transcript *transcript,
+                             char record_id[TEST_RECORD_ID_BYTES * 2 + 2])
+{
+    static const char prefix[] = "ID: ";
+    size_t encoded_length = TEST_RECORD_ID_BYTES * 2;
+
+    for (size_t offset = 0;
+         offset + sizeof(prefix) - 1 + encoded_length <= transcript->length;
+         ++offset) {
+        if (memcmp(transcript->data + offset, prefix,
+                   sizeof(prefix) - 1) == 0) {
+            const unsigned char *encoded = transcript->data + offset +
+                                            sizeof(prefix) - 1;
+
+            for (size_t index = 0; index < encoded_length; ++index) {
+                if (!((encoded[index] >= '0' && encoded[index] <= '9') ||
+                      (encoded[index] >= 'a' && encoded[index] <= 'f'))) {
+                    return 0;
+                }
+                record_id[index] = (char)encoded[index];
+            }
+            record_id[encoded_length] = '\n';
+            record_id[encoded_length + 1] = '\0';
             return 1;
         }
     }
@@ -593,6 +623,7 @@ int main(int argc, char *argv[])
     static const char master_password[] = "dummy-master-password-42";
     static const char wrong_password[] = "dummy-wrong-password";
     static const char credential_password[] = "dummy-credential-secret-73";
+    static const char updated_password[] = "updated-dummy-secret-91";
     static const char mismatch_password[] = "dummy-mismatch-password";
     static const struct dialog_step oversized_steps[] = {
         {"Choice: ", "1\n"},
@@ -638,7 +669,7 @@ int main(int argc, char *argv[])
         {"Username: ", "Alice\n"},
         {"Master password: ", "dummy-master-password-42\n"},
         {"Login successful.", NULL},
-        {"Choice: ", "4\n"}
+        {"Choice: ", "7\n"}
     };
     static const struct dialog_step add_steps[] = {
         {"Choice: ", "2\n"},
@@ -653,7 +684,7 @@ int main(int argc, char *argv[])
         {"Credential password: ", "dummy-credential-secret-73\n"},
         {"Notes (optional): ", "dummy notes\n"},
         {"Credential added.", NULL},
-        {"Choice: ", "3\n"},
+        {"Choice: ", "6\n"},
         {"Vault locked.", NULL},
         {"Choice: ", "3\n"}
     };
@@ -664,7 +695,7 @@ int main(int argc, char *argv[])
         {"Login successful.", NULL},
         {"Choice: ", "2\n"},
         {"Label: Example Service | Username: dummy-user", NULL},
-        {"Choice: ", "4\n"}
+        {"Choice: ", "7\n"}
     };
     static const struct dialog_step failed_vault_steps[] = {
         {"Choice: ", "2\n"},
@@ -682,6 +713,8 @@ int main(int argc, char *argv[])
     unsigned char *after_failure = NULL;
     size_t vault_length = 0;
     size_t after_failure_length = 0;
+    char record_id[TEST_RECORD_ID_BYTES * 2 + 2] = {0};
+    char oversized_label[131];
     struct timespec throttle_start = {0};
     struct timespec throttle_end = {0};
     const char *program;
@@ -750,6 +783,155 @@ int main(int argc, char *argv[])
     CHECK(!contains_bytes(transcript.data, transcript.length,
                           (const unsigned char *)credential_password,
                           sizeof(credential_password) - 1));
+    CHECK(extract_record_id(&transcript, record_id));
+
+    if (record_id[0] != '\0') {
+        static const char missing_id[] =
+            "00000000000000000000000000000000\n";
+        const struct dialog_step view_steps[] = {
+            {"Choice: ", "2\n"},
+            {"Username: ", "Alice\n"},
+            {"Master password: ", "dummy-master-password-42\n"},
+            {"Login successful.", NULL},
+            {"Choice: ", "3\n"},
+            {"Record ID: ", "bad-id\n"},
+            {"Invalid record ID.", NULL},
+            {"Choice: ", "3\n"},
+            {"Record ID: ", missing_id},
+            {"Credential not found.", NULL},
+            {"Choice: ", "3\n"},
+            {"Record ID: ", record_id},
+            {"Label: Example Service", NULL},
+            {"Username: dummy-user", NULL},
+            {"Notes: dummy notes", NULL},
+            {"Password: hidden", NULL},
+            {"Choice: ", "7\n"}
+        };
+
+        CHECK(run_dialog(program, home, view_steps,
+                         sizeof(view_steps) / sizeof(view_steps[0]),
+                         &transcript));
+        CHECK(!contains_bytes(transcript.data, transcript.length,
+                              (const unsigned char *)credential_password,
+                              sizeof(credential_password) - 1));
+
+        memset(oversized_label, 'A', sizeof(oversized_label) - 2);
+        oversized_label[sizeof(oversized_label) - 2] = '\n';
+        oversized_label[sizeof(oversized_label) - 1] = '\0';
+        {
+            const struct dialog_step failed_update_steps[] = {
+                {"Choice: ", "2\n"},
+                {"Username: ", "Alice\n"},
+                {"Master password: ", "dummy-master-password-42\n"},
+                {"Login successful.", NULL},
+                {"Choice: ", "4\n"},
+                {"Record ID: ", record_id},
+                {"New label: ", oversized_label},
+                {"Input too long.", NULL},
+                {"Choice: ", "2\n"},
+                {"Label: Example Service | Username: dummy-user", NULL},
+                {"Choice: ", "7\n"}
+            };
+
+            CHECK(run_dialog(program, home, failed_update_steps,
+                             sizeof(failed_update_steps) /
+                                 sizeof(failed_update_steps[0]),
+                             &transcript));
+        }
+        {
+            const struct dialog_step update_steps[] = {
+                {"Choice: ", "2\n"},
+                {"Username: ", "Alice\n"},
+                {"Master password: ", "dummy-master-password-42\n"},
+                {"Login successful.", NULL},
+                {"Choice: ", "4\n"},
+                {"Record ID: ", record_id},
+                {"New label: ", "Updated Service\n"},
+                {"New credential username: ", "updated-user\n"},
+                {"New credential password: ",
+                 "updated-dummy-secret-91\n"},
+                {"New notes (optional): ", "updated notes\n"},
+                {"Credential updated.", NULL},
+                {"Choice: ", "6\n"},
+                {"Vault locked.", NULL},
+                {"Choice: ", "3\n"}
+            };
+
+            CHECK(run_dialog(program, home, update_steps,
+                             sizeof(update_steps) / sizeof(update_steps[0]),
+                             &transcript));
+            CHECK(!contains_bytes(transcript.data, transcript.length,
+                                  (const unsigned char *)updated_password,
+                                  sizeof(updated_password) - 1));
+        }
+        {
+            const struct dialog_step persisted_update_steps[] = {
+                {"Choice: ", "2\n"},
+                {"Username: ", "Alice\n"},
+                {"Master password: ", "dummy-master-password-42\n"},
+                {"Login successful.", NULL},
+                {"Choice: ", "2\n"},
+                {"Label: Updated Service | Username: updated-user", NULL},
+                {"Choice: ", "3\n"},
+                {"Record ID: ", record_id},
+                {"Notes: updated notes", NULL},
+                {"Password: hidden", NULL},
+                {"Choice: ", "7\n"}
+            };
+
+            CHECK(run_dialog(program, home, persisted_update_steps,
+                             sizeof(persisted_update_steps) /
+                                 sizeof(persisted_update_steps[0]),
+                             &transcript));
+            CHECK(!contains_bytes(transcript.data, transcript.length,
+                                  (const unsigned char *)credential_password,
+                                  sizeof(credential_password) - 1));
+            CHECK(!contains_bytes(transcript.data, transcript.length,
+                                  (const unsigned char *)updated_password,
+                                  sizeof(updated_password) - 1));
+        }
+        {
+            const struct dialog_step delete_steps[] = {
+                {"Choice: ", "2\n"},
+                {"Username: ", "Alice\n"},
+                {"Master password: ", "dummy-master-password-42\n"},
+                {"Login successful.", NULL},
+                {"Choice: ", "5\n"},
+                {"Record ID: ", record_id},
+                {"Type yes to confirm deletion: ", "no\n"},
+                {"Deletion cancelled.", NULL},
+                {"Choice: ", "2\n"},
+                {"Label: Updated Service | Username: updated-user", NULL},
+                {"Choice: ", "5\n"},
+                {"Record ID: ", record_id},
+                {"Type yes to confirm deletion: ", "yes\n"},
+                {"Credential deleted.", NULL},
+                {"Choice: ", "6\n"},
+                {"Vault locked.", NULL},
+                {"Choice: ", "3\n"}
+            };
+            static const struct dialog_step persisted_delete_steps[] = {
+                {"Choice: ", "2\n"},
+                {"Username: ", "Alice\n"},
+                {"Master password: ", "dummy-master-password-42\n"},
+                {"Login successful.", NULL},
+                {"Choice: ", "2\n"},
+                {"No credentials.", NULL},
+                {"Choice: ", "7\n"}
+            };
+
+            CHECK(run_dialog(program, home, delete_steps,
+                             sizeof(delete_steps) / sizeof(delete_steps[0]),
+                             &transcript));
+            CHECK(run_dialog(program, home, persisted_delete_steps,
+                             sizeof(persisted_delete_steps) /
+                                 sizeof(persisted_delete_steps[0]),
+                             &transcript));
+            CHECK(!contains_bytes(transcript.data, transcript.length,
+                                  (const unsigned char *)updated_password,
+                                  sizeof(updated_password) - 1));
+        }
+    }
 
     vault_data = read_file(vault_path, &vault_length);
     CHECK(vault_data != NULL && vault_length != 0);

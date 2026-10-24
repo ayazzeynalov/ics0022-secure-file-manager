@@ -103,11 +103,13 @@ int vault_write(const struct storage *storage,
                 const unsigned char *plaintext, size_t plaintext_length)
 {
     unsigned char *serialized = NULL;
+    unsigned char *installed = NULL;
     unsigned char *ciphertext;
     unsigned char *nonce;
     unsigned char *tag;
     char filename[VAULT_FILENAME_BYTES];
     size_t ciphertext_length = 0;
+    size_t installed_length = 0;
     size_t serialized_length;
     int success = 0;
 
@@ -134,14 +136,27 @@ int vault_write(const struct storage *storage,
                                    &ciphertext_length,
                                    nonce, CRYPTO_GCM_NONCE_BYTES,
                                    tag, CRYPTO_GCM_TAG_BYTES) ||
-        ciphertext_length != plaintext_length ||
-        !storage_atomic_write(storage, STORAGE_AREA_VAULTS, filename,
-                              serialized, serialized_length)) {
+        ciphertext_length != plaintext_length) {
         goto cleanup;
+    }
+    if (!storage_atomic_write(storage, STORAGE_AREA_VAULTS, filename,
+                              serialized, serialized_length)) {
+        int saved_errno = errno;
+
+        /* renameat() may succeed before directory synchronization fails. */
+        if (vault_read(storage, session, &installed, &installed_length) !=
+                VAULT_READ_OK ||
+            installed_length != plaintext_length ||
+            (plaintext_length != 0 &&
+             CRYPTO_memcmp(installed, plaintext, plaintext_length) != 0)) {
+            errno = saved_errno;
+            goto cleanup;
+        }
     }
     success = 1;
 
 cleanup:
+    vault_secure_free(installed, installed_length);
     free(serialized);
     return success;
 }

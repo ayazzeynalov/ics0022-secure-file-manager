@@ -79,7 +79,7 @@ build/test_account: build/test_account.o build/account.o build/user_db.o \
 build/test_vault.o: tests/test_vault.c | build check-openssl
 	$(CC) $(CPPFLAGS) -Isrc $(OPENSSL_CFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
 
-build/test_vault: build/test_vault.o build/vault.o build/storage.o \
+build/test_vault: build/test_vault.o build/vault.o build/storage_test.o \
 		build/crypto.o build/account.o build/user_db.o build/auth.o | check-openssl
 	$(CC) $(LDFLAGS) $^ $(OPENSSL_LIBS) $(LDLIBS) -o $@
 

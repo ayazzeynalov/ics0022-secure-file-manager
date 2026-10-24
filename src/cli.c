@@ -68,12 +68,12 @@ static void throttle_login_failure(struct login_throttle *throttle,
 
 static void print_help(const char *program)
 {
-    printf("Secure Password Manager - Checkpoint 2\n\n");
+    printf("Secure Password Manager\n\n");
     printf("Usage:\n");
     printf("  %s\n", program);
     printf("  %s --help\n\n", program);
     printf("Run without arguments in a terminal to create a user, log in, ");
-    printf("add credentials, or list credential labels and usernames.\n");
+    printf("add, view, update, delete, or list credentials.\n");
     printf("Passwords are read interactively and are never accepted as ");
     printf("command-line arguments.\n");
 }
@@ -115,6 +115,19 @@ static int serialize_and_write(const struct storage *storage,
 cleanup:
     credentials_serialized_free(payload, payload_length);
     return success;
+}
+
+static int save_updated_collection(
+    const struct storage *storage, const struct account_session *session,
+    struct credential_collection *collection,
+    const struct credential_collection *updated)
+{
+    if (!serialize_and_write(storage, session, updated)) {
+        return 0;
+    }
+    credentials_cleanup(collection);
+    memcpy(collection, updated, sizeof(*collection));
+    return 1;
 }
 
 static int register_user(const struct storage *storage)
@@ -241,6 +254,52 @@ static void print_safe_field(const unsigned char *field, size_t length)
     }
 }
 
+static int hexadecimal_value(char character)
+{
+    if (character >= '0' && character <= '9') {
+        return character - '0';
+    }
+    if (character >= 'a' && character <= 'f') {
+        return character - 'a' + 10;
+    }
+    if (character >= 'A' && character <= 'F') {
+        return character - 'A' + 10;
+    }
+    return -1;
+}
+
+static int read_record_id(unsigned char record_id[CREDENTIALS_RECORD_ID_BYTES])
+{
+    char encoded[CREDENTIALS_RECORD_ID_BYTES * 2 + 1];
+    size_t encoded_length = 0;
+    int read_result = read_value("Record ID: ", encoded, sizeof(encoded),
+                                 &encoded_length, 0);
+
+    if (read_result <= 0) {
+        OPENSSL_cleanse(encoded, sizeof(encoded));
+        return read_result;
+    }
+    if (encoded_length != CREDENTIALS_RECORD_ID_BYTES * 2) {
+        puts("Invalid record ID.");
+        OPENSSL_cleanse(encoded, sizeof(encoded));
+        return 0;
+    }
+    for (size_t index = 0; index < CREDENTIALS_RECORD_ID_BYTES; ++index) {
+        int high = hexadecimal_value(encoded[index * 2]);
+        int low = hexadecimal_value(encoded[index * 2 + 1]);
+
+        if (high < 0 || low < 0) {
+            puts("Invalid record ID.");
+            OPENSSL_cleanse(record_id, CREDENTIALS_RECORD_ID_BYTES);
+            OPENSSL_cleanse(encoded, sizeof(encoded));
+            return 0;
+        }
+        record_id[index] = (unsigned char)((high << 4) | low);
+    }
+    OPENSSL_cleanse(encoded, sizeof(encoded));
+    return 1;
+}
+
 static void list_credentials(const struct account_session *session,
                              const struct credential_collection *collection)
 {
@@ -263,6 +322,43 @@ static void list_credentials(const struct account_session *session,
         print_safe_field(record->username, record->username_length);
         putchar('\n');
     }
+}
+
+static int view_credential(const struct account_session *session,
+                           const struct credential_collection *collection)
+{
+    unsigned char record_id[CREDENTIALS_RECORD_ID_BYTES] = {0};
+    const struct credential_record *record;
+    int read_result;
+    int action = ACTION_CONTINUE;
+
+    if (session == NULL || session->unlocked != 1 || collection == NULL) {
+        puts("Vault is locked.");
+        return action;
+    }
+    read_result = read_record_id(record_id);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        goto cleanup;
+    }
+    record = credentials_find(collection, record_id, sizeof(record_id));
+    if (record == NULL) {
+        puts("Credential not found.");
+        goto cleanup;
+    }
+    fputs("ID: ", stdout);
+    print_record_id(record->id);
+    fputs("\nLabel: ", stdout);
+    print_safe_field(record->label, record->label_length);
+    fputs("\nUsername: ", stdout);
+    print_safe_field(record->username, record->username_length);
+    fputs("\nNotes: ", stdout);
+    print_safe_field(record->notes, record->notes_length);
+    fputs("\nPassword: hidden\n", stdout);
+
+cleanup:
+    OPENSSL_cleanse(record_id, sizeof(record_id));
+    return action;
 }
 
 static int add_credential(const struct storage *storage,
@@ -328,12 +424,10 @@ static int add_credential(const struct storage *storage,
     }
     OPENSSL_cleanse(password, sizeof(password));
     password_length = 0;
-    if (!serialize_and_write(storage, session, updated)) {
+    if (!save_updated_collection(storage, session, collection, updated)) {
         puts("Credential could not be saved.");
         goto cleanup;
     }
-    credentials_cleanup(collection);
-    memcpy(collection, updated, sizeof(*collection));
     puts("Credential added.");
 
 cleanup:
@@ -342,6 +436,154 @@ cleanup:
     OPENSSL_cleanse(label, sizeof(label));
     OPENSSL_cleanse(username, sizeof(username));
     OPENSSL_cleanse(notes, sizeof(notes));
+    if (updated != NULL) {
+        credentials_cleanup(updated);
+        free(updated);
+    }
+    return action;
+}
+
+static int update_credential(const struct storage *storage,
+                             const struct account_session *session,
+                             struct credential_collection *collection)
+{
+    unsigned char record_id[CREDENTIALS_RECORD_ID_BYTES] = {0};
+    char label[CREDENTIALS_LABEL_MAX_BYTES + 1];
+    char username[CREDENTIALS_USERNAME_MAX_BYTES + 1];
+    char password[CREDENTIALS_PASSWORD_MAX_BYTES + 1];
+    char notes[CREDENTIALS_NOTES_MAX_BYTES + 1];
+    struct credential_collection *updated = NULL;
+    size_t label_length = 0;
+    size_t username_length = 0;
+    size_t password_length = 0;
+    size_t notes_length = 0;
+    int read_result;
+    int action = ACTION_CONTINUE;
+
+    memset(password, 0, sizeof(password));
+    if (session == NULL || session->unlocked != 1) {
+        puts("Vault is locked.");
+        goto cleanup;
+    }
+    read_result = read_record_id(record_id);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        goto cleanup;
+    }
+    if (credentials_find(collection, record_id, sizeof(record_id)) == NULL) {
+        puts("Credential not found.");
+        goto cleanup;
+    }
+    read_result = read_value("New label: ", label, sizeof(label),
+                             &label_length, 0);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        goto cleanup;
+    }
+    read_result = read_value("New credential username: ", username,
+                             sizeof(username), &username_length, 0);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        goto cleanup;
+    }
+    read_result = read_value("New credential password: ", password,
+                             sizeof(password), &password_length, 1);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        goto cleanup;
+    }
+    read_result = read_value("New notes (optional): ", notes, sizeof(notes),
+                             &notes_length, 0);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        goto cleanup;
+    }
+    updated = malloc(sizeof(*updated));
+    if (updated == NULL) {
+        puts("Credential could not be updated.");
+        goto cleanup;
+    }
+    memcpy(updated, collection, sizeof(*updated));
+    if (!credentials_update(updated, record_id, sizeof(record_id),
+                            (const unsigned char *)label, label_length,
+                            (const unsigned char *)username, username_length,
+                            (const unsigned char *)password, password_length,
+                            (const unsigned char *)notes, notes_length)) {
+        puts("Credential could not be updated.");
+        goto cleanup;
+    }
+    OPENSSL_cleanse(password, sizeof(password));
+    password_length = 0;
+    if (!save_updated_collection(storage, session, collection, updated)) {
+        puts("Credential could not be updated.");
+        goto cleanup;
+    }
+    puts("Credential updated.");
+
+cleanup:
+    OPENSSL_cleanse(record_id, sizeof(record_id));
+    OPENSSL_cleanse(label, sizeof(label));
+    OPENSSL_cleanse(username, sizeof(username));
+    OPENSSL_cleanse(password, sizeof(password));
+    OPENSSL_cleanse(notes, sizeof(notes));
+    if (updated != NULL) {
+        credentials_cleanup(updated);
+        free(updated);
+    }
+    return action;
+}
+
+static int delete_credential(const struct storage *storage,
+                             const struct account_session *session,
+                             struct credential_collection *collection)
+{
+    unsigned char record_id[CREDENTIALS_RECORD_ID_BYTES] = {0};
+    char confirmation[8];
+    struct credential_collection *updated = NULL;
+    size_t confirmation_length = 0;
+    int read_result;
+    int action = ACTION_CONTINUE;
+
+    if (session == NULL || session->unlocked != 1) {
+        puts("Vault is locked.");
+        goto cleanup;
+    }
+    read_result = read_record_id(record_id);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        goto cleanup;
+    }
+    if (credentials_find(collection, record_id, sizeof(record_id)) == NULL) {
+        puts("Credential not found.");
+        goto cleanup;
+    }
+    read_result = read_value("Type yes to confirm deletion: ", confirmation,
+                             sizeof(confirmation), &confirmation_length, 0);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        goto cleanup;
+    }
+    if (confirmation_length != 3 ||
+        memcmp(confirmation, "yes", 3) != 0) {
+        puts("Deletion cancelled.");
+        goto cleanup;
+    }
+    updated = malloc(sizeof(*updated));
+    if (updated == NULL) {
+        puts("Credential could not be deleted.");
+        goto cleanup;
+    }
+    memcpy(updated, collection, sizeof(*updated));
+    if (!credentials_delete(updated, record_id, sizeof(record_id)) ||
+        !save_updated_collection(storage, session, collection, updated)) {
+        puts("Credential could not be deleted.");
+        goto cleanup;
+    }
+    puts("Credential deleted.");
+
+cleanup:
+    OPENSSL_cleanse(record_id, sizeof(record_id));
+    OPENSSL_cleanse(confirmation, sizeof(confirmation));
     if (updated != NULL) {
         credentials_cleanup(updated);
         free(updated);
@@ -362,8 +604,11 @@ static int authenticated_menu(
         puts("\nVault menu:");
         puts("1. Add credential");
         puts("2. List credentials");
-        puts("3. Lock");
-        puts("4. Exit");
+        puts("3. View credential details");
+        puts("4. Update credential");
+        puts("5. Delete credential");
+        puts("6. Lock");
+        puts("7. Exit");
         read_result = read_value("Choice: ", choice, sizeof(choice),
                                  &choice_length, 0);
         if (read_result < 0) {
@@ -380,11 +625,25 @@ static int authenticated_menu(
         } else if (choice_length == 1 && choice[0] == '2') {
             list_credentials(session, collection);
         } else if (choice_length == 1 && choice[0] == '3') {
+            if (view_credential(session, collection) == ACTION_INPUT_END) {
+                return ACTION_INPUT_END;
+            }
+        } else if (choice_length == 1 && choice[0] == '4') {
+            if (update_credential(storage, session, collection) ==
+                ACTION_INPUT_END) {
+                return ACTION_INPUT_END;
+            }
+        } else if (choice_length == 1 && choice[0] == '5') {
+            if (delete_credential(storage, session, collection) ==
+                ACTION_INPUT_END) {
+                return ACTION_INPUT_END;
+            }
+        } else if (choice_length == 1 && choice[0] == '6') {
             account_session_lock(session);
             credentials_cleanup(collection);
             puts("Vault locked.");
             return ACTION_CONTINUE;
-        } else if (choice_length == 1 && choice[0] == '4') {
+        } else if (choice_length == 1 && choice[0] == '7') {
             return ACTION_EXIT;
         } else {
             puts("Invalid choice.");
