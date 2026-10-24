@@ -492,6 +492,7 @@ static void test_embedded_nul(const char *program, const char *home)
 static void test_registration_vault_failure(const char *program)
 {
     static const char password[] = "dummy-incomplete-registration-password";
+    static const char wrong_password[] = "dummy-incomplete-wrong-password";
     char home_template[TEST_PATH_BYTES];
     char securepm_path[TEST_PATH_BYTES] = {0};
     char vaults_path[TEST_PATH_BYTES] = {0};
@@ -543,6 +544,20 @@ static void test_registration_vault_failure(const char *program)
                   wait_for_text(master, &transcript, "Username: ") &&
                   write_all(master, "Incomplete\n") &&
                   wait_for_text(master, &transcript, "Master password: ") &&
+                  write_all(master, "dummy-incomplete-wrong-password\n") &&
+                  wait_for_text(master, &transcript,
+                                "Confirm master password: ") &&
+                  write_all(master, "dummy-incomplete-wrong-password\n") &&
+                  wait_for_text(master, &transcript, "Registration failed.");
+        CHECK(success);
+    }
+    if (success) {
+        CHECK(!find_vault(home, vault_path));
+        success = wait_for_text(master, &transcript, "Choice: ") &&
+                  write_all(master, "1\n") &&
+                  wait_for_text(master, &transcript, "Username: ") &&
+                  write_all(master, "Incomplete\n") &&
+                  wait_for_text(master, &transcript, "Master password: ") &&
                   write_all(master,
                             "dummy-incomplete-registration-password\n") &&
                   wait_for_text(master, &transcript,
@@ -566,6 +581,9 @@ static void test_registration_vault_failure(const char *program)
     CHECK(!contains_bytes(transcript.data, transcript.length,
                           (const unsigned char *)password,
                           sizeof(password) - 1));
+    CHECK(!contains_bytes(transcript.data, transcript.length,
+                          (const unsigned char *)wrong_password,
+                          sizeof(wrong_password) - 1));
     CHECK(find_vault(home, vault_path));
     CHECK(remove_tree(home));
 }

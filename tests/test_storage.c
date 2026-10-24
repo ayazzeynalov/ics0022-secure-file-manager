@@ -466,6 +466,81 @@ static void test_locking(const struct storage *storage, const char *home)
     CHECK(!storage_lock_is_held(&lock));
 }
 
+static void test_unsafe_lock_files(const struct storage *storage,
+                                   const char *home)
+{
+    static const unsigned char data[] = "lock";
+    struct storage_lock lock = STORAGE_LOCK_INITIALIZER;
+    char root[TEST_PATH_BYTES];
+    char outside[TEST_PATH_BYTES];
+    char path[TEST_PATH_BYTES];
+    char alias[TEST_PATH_BYTES];
+
+    CHECK(make_path(root, home, ".securepm"));
+    CHECK(make_path(outside, home, "outside.lock"));
+    CHECK(write_direct(outside, data, sizeof(data) - 1, STORAGE_FILE_MODE));
+
+    CHECK(make_path(path, root, "symlink.lock"));
+    CHECK(symlink("../outside.lock", path) == 0);
+    CHECK(storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                               "symlink.lock", &lock) == 0);
+    CHECK(!storage_lock_is_held(&lock));
+
+    CHECK(make_path(path, root, "permissive.lock"));
+    CHECK(write_direct(path, data, sizeof(data) - 1, 0644));
+    CHECK(storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                               "permissive.lock", &lock) == 0);
+    CHECK(!storage_lock_is_held(&lock));
+
+    CHECK(make_path(path, root, "linked.lock"));
+    CHECK(make_path(alias, root, "linked-alias.lock"));
+    CHECK(write_direct(path, data, sizeof(data) - 1, STORAGE_FILE_MODE));
+    CHECK(link(path, alias) == 0);
+    CHECK(storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                               "linked.lock", &lock) == 0);
+    CHECK(!storage_lock_is_held(&lock));
+}
+
+static void test_lock_cleanup_after_exit(const struct storage *storage)
+{
+    struct storage_lock lock = STORAGE_LOCK_INITIALIZER;
+    int ready_pipe[2] = {-1, -1};
+    char byte;
+    int status = 0;
+    pid_t child;
+
+    CHECK(pipe(ready_pipe) == 0);
+    if (ready_pipe[0] < 0) {
+        return;
+    }
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        struct storage_lock child_lock = STORAGE_LOCK_INITIALIZER;
+
+        close(ready_pipe[0]);
+        if (!storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                                  "exit-cleanup.lock", &child_lock) ||
+            write(ready_pipe[1], "R", 1) != 1) {
+            _exit(1);
+        }
+        _exit(0);
+    }
+    close(ready_pipe[1]);
+    ready_pipe[1] = -1;
+    if (child > 0) {
+        CHECK(read(ready_pipe[0], &byte, 1) == 1 && byte == 'R');
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        CHECK(storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                                   "exit-cleanup.lock", &lock) == 1);
+        CHECK(storage_lock_is_held(&lock));
+    }
+    storage_lock_release(&lock);
+    close(ready_pipe[0]);
+    CHECK(!storage_lock_is_held(&lock));
+}
+
 int main(void)
 {
     char home_template[TEST_PATH_BYTES];
@@ -493,6 +568,8 @@ int main(void)
         test_oversized_file(&storage, home);
         test_failed_write_cleanup(&storage, home);
         test_locking(&storage, home);
+        test_unsafe_lock_files(&storage, home);
+        test_lock_cleanup_after_exit(&storage);
     }
     storage_close(&storage);
     CHECK(remove_tree(home));
