@@ -1,0 +1,647 @@
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#else
+#define _XOPEN_SOURCE 700
+#endif
+
+#include "credentials.h"
+
+#include "account.h"
+#include "storage.h"
+#include "vault.h"
+
+#include <dirent.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <openssl/crypto.h>
+
+#define TEST_PATH_BYTES 4096
+#define TEST_VAULT_FILENAME_BYTES 39
+#define TEST_HEADER_BYTES 16
+#define TEST_RECORD_HEADER_BYTES 32
+
+static unsigned int checks;
+static unsigned int failures;
+
+#define CHECK(condition) do { \
+    ++checks; \
+    if (!(condition)) { \
+        fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, #condition); \
+        ++failures; \
+    } \
+} while (0)
+
+static struct credential_collection *new_collection(void)
+{
+    struct credential_collection *collection = malloc(sizeof(*collection));
+
+    if (collection != NULL) {
+        credentials_init(collection);
+    }
+    return collection;
+}
+
+static int all_zero(const void *data, size_t length)
+{
+    const unsigned char *bytes = data;
+
+    for (size_t index = 0; index < length; ++index) {
+        if (bytes[index] != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int contains_bytes(const unsigned char *data, size_t data_length,
+                          const unsigned char *needle, size_t needle_length)
+{
+    if (needle_length == 0 || needle_length > data_length) {
+        return 0;
+    }
+    for (size_t offset = 0; offset <= data_length - needle_length; ++offset) {
+        if (memcmp(data + offset, needle, needle_length) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static uint32_t read_u32(const unsigned char input[4])
+{
+    return (uint32_t)input[0] << 24 |
+           (uint32_t)input[1] << 16 |
+           (uint32_t)input[2] << 8 |
+           input[3];
+}
+
+static void write_u32(unsigned char output[4], uint32_t value)
+{
+    output[0] = (unsigned char)(value >> 24);
+    output[1] = (unsigned char)(value >> 16);
+    output[2] = (unsigned char)(value >> 8);
+    output[3] = (unsigned char)value;
+}
+
+static int add_record(struct credential_collection *collection,
+                      const unsigned char *label, size_t label_length,
+                      const unsigned char *username, size_t username_length,
+                      const unsigned char *password, size_t password_length,
+                      const unsigned char *notes, size_t notes_length,
+                      unsigned char id[CREDENTIALS_RECORD_ID_BYTES])
+{
+    return credentials_add(collection, label, label_length,
+                           username, username_length,
+                           password, password_length,
+                           notes, notes_length, id);
+}
+
+static void test_empty_collection(void)
+{
+    struct credential_collection *collection = new_collection();
+    struct credential_collection *decoded = new_collection();
+    unsigned char *payload = (unsigned char *)1;
+    size_t payload_length = 123;
+
+    CHECK(collection != NULL && decoded != NULL);
+    if (collection == NULL || decoded == NULL) {
+        free(collection);
+        free(decoded);
+        return;
+    }
+    CHECK(credentials_serialize(collection, &payload, &payload_length) == 1);
+    CHECK(payload != NULL && payload_length == TEST_HEADER_BYTES);
+    if (payload != NULL && payload_length == TEST_HEADER_BYTES) {
+        CHECK(memcmp(payload, "SPMCREDS", 8) == 0);
+        CHECK(read_u32(payload + 8) == CREDENTIALS_FORMAT_VERSION);
+        CHECK(read_u32(payload + 12) == 0);
+        CHECK(credentials_deserialize(payload, payload_length, decoded) == 1);
+    }
+    CHECK(decoded->count == 0);
+    credentials_serialized_free(payload, payload_length);
+    credentials_cleanup(collection);
+    credentials_cleanup(decoded);
+    free(collection);
+    free(decoded);
+}
+
+static void test_add_find_and_round_trip(void)
+{
+    static const unsigned char label_one[] = "mail/account\nprimary";
+    static const unsigned char username_one[] = "dummy+user@example.test";
+    static const unsigned char password_one[] = {0x00, 'a', '\n', 0xff, 'Z'};
+    static const unsigned char notes_one[] = "symbols: !@#$%^&*()";
+    static const unsigned char label_two[] = "server";
+    static const unsigned char password_two[] = "second-dummy-password";
+    struct credential_collection *collection = new_collection();
+    struct credential_collection *decoded = new_collection();
+    unsigned char first_id[CREDENTIALS_RECORD_ID_BYTES];
+    unsigned char second_id[CREDENTIALS_RECORD_ID_BYTES];
+    unsigned char missing_id[CREDENTIALS_RECORD_ID_BYTES] = {0};
+    unsigned char *payload = NULL;
+    size_t payload_length = 0;
+    const struct credential_record *record;
+
+    CHECK(collection != NULL && decoded != NULL);
+    if (collection == NULL || decoded == NULL) {
+        free(collection);
+        free(decoded);
+        return;
+    }
+    CHECK(add_record(collection,
+                     label_one, sizeof(label_one) - 1,
+                     username_one, sizeof(username_one) - 1,
+                     password_one, sizeof(password_one),
+                     notes_one, sizeof(notes_one) - 1, first_id) == 1);
+    CHECK(add_record(collection,
+                     label_two, sizeof(label_two) - 1,
+                     NULL, 0,
+                     password_two, sizeof(password_two) - 1,
+                     NULL, 0, second_id) == 1);
+    CHECK(collection->count == 2);
+    CHECK(memcmp(first_id, second_id, sizeof(first_id)) != 0);
+    record = credentials_find(collection, first_id, sizeof(first_id));
+    CHECK(record != NULL);
+    if (record != NULL) {
+        CHECK(record->label_length == sizeof(label_one) - 1);
+        CHECK(memcmp(record->label, label_one, record->label_length) == 0);
+        CHECK(record->password_length == sizeof(password_one));
+        CHECK(memcmp(record->password, password_one,
+                     record->password_length) == 0);
+    }
+    CHECK(credentials_find(collection, missing_id, sizeof(missing_id)) == NULL);
+    CHECK(credentials_find(collection, first_id, sizeof(first_id) - 1) == NULL);
+    CHECK(credentials_find(NULL, first_id, sizeof(first_id)) == NULL);
+
+    CHECK(credentials_serialize(collection, &payload, &payload_length) == 1);
+    CHECK(payload_length <= VAULT_MAX_PLAINTEXT_BYTES);
+    CHECK(read_u32(payload + 12) == 2);
+    CHECK(memcmp(payload + TEST_HEADER_BYTES, first_id,
+                 CREDENTIALS_RECORD_ID_BYTES) == 0);
+    CHECK(read_u32(payload + 32) == sizeof(label_one) - 1);
+    CHECK(read_u32(payload + 36) == sizeof(username_one) - 1);
+    CHECK(read_u32(payload + 40) == sizeof(password_one));
+    CHECK(read_u32(payload + 44) == sizeof(notes_one) - 1);
+    CHECK(credentials_deserialize(payload, payload_length, decoded) == 1);
+    CHECK(decoded->count == 2);
+    record = credentials_find(decoded, first_id, sizeof(first_id));
+    CHECK(record != NULL);
+    if (record != NULL) {
+        CHECK(memcmp(record->id, first_id, sizeof(first_id)) == 0);
+        CHECK(record->username_length == sizeof(username_one) - 1);
+        CHECK(memcmp(record->username, username_one,
+                     record->username_length) == 0);
+        CHECK(record->password_length == sizeof(password_one));
+        CHECK(memcmp(record->password, password_one,
+                     record->password_length) == 0);
+        CHECK(record->notes_length == sizeof(notes_one) - 1);
+        CHECK(memcmp(record->notes, notes_one, record->notes_length) == 0);
+    }
+    record = credentials_find(decoded, second_id, sizeof(second_id));
+    CHECK(record != NULL);
+    if (record != NULL) {
+        CHECK(record->username_length == 0 && record->notes_length == 0);
+    }
+    credentials_serialized_free(payload, payload_length);
+    credentials_cleanup(collection);
+    credentials_cleanup(decoded);
+    free(collection);
+    free(decoded);
+}
+
+static void test_limits_and_invalid_inputs(void)
+{
+    struct credential_collection *collection = new_collection();
+    struct credential_collection *decoded = new_collection();
+    unsigned char label[CREDENTIALS_LABEL_MAX_BYTES];
+    unsigned char username[CREDENTIALS_USERNAME_MAX_BYTES];
+    unsigned char password[CREDENTIALS_PASSWORD_MAX_BYTES];
+    unsigned char notes[CREDENTIALS_NOTES_MAX_BYTES];
+    unsigned char id[CREDENTIALS_RECORD_ID_BYTES];
+    unsigned char *payload = (unsigned char *)1;
+    size_t payload_length = 99;
+
+    CHECK(collection != NULL && decoded != NULL);
+    if (collection == NULL || decoded == NULL) {
+        free(collection);
+        free(decoded);
+        return;
+    }
+    memset(label, 'l', sizeof(label));
+    memset(username, 'u', sizeof(username));
+    memset(password, 0xa5, sizeof(password));
+    memset(notes, 'n', sizeof(notes));
+    CHECK(add_record(collection, label, sizeof(label), username,
+                     sizeof(username), password, sizeof(password),
+                     notes, sizeof(notes), id) == 1);
+    CHECK(credentials_serialize(collection, &payload, &payload_length) == 1);
+    CHECK(payload_length == TEST_HEADER_BYTES + TEST_RECORD_HEADER_BYTES +
+                            sizeof(label) + sizeof(username) +
+                            sizeof(password) + sizeof(notes));
+    CHECK(credentials_deserialize(payload, payload_length, decoded) == 1);
+    CHECK(decoded->records[0].label_length == sizeof(label));
+    CHECK(decoded->records[0].password_length == sizeof(password));
+    credentials_serialized_free(payload, payload_length);
+
+    CHECK(add_record(collection, NULL, 0, NULL, 0, NULL, 0,
+                     NULL, 0, id) == 0);
+    CHECK(add_record(collection, label, sizeof(label) + 1,
+                     NULL, 0, NULL, 0, NULL, 0, id) == 0);
+    CHECK(add_record(collection, label, 1,
+                     username, sizeof(username) + 1,
+                     NULL, 0, NULL, 0, id) == 0);
+    CHECK(add_record(collection, label, 1, NULL, 0,
+                     password, sizeof(password) + 1,
+                     NULL, 0, id) == 0);
+    CHECK(add_record(collection, label, 1, NULL, 0, NULL, 0,
+                     notes, sizeof(notes) + 1, id) == 0);
+    CHECK(add_record(collection, label, 1, NULL, 1,
+                     NULL, 0, NULL, 0, id) == 0);
+    CHECK(credentials_add(NULL, label, 1, NULL, 0, NULL, 0,
+                          NULL, 0, id) == 0);
+    CHECK(credentials_add(collection, label, 1, NULL, 0, NULL, 0,
+                          NULL, 0, NULL) == 0);
+    CHECK(credentials_serialize(NULL, &payload, &payload_length) == 0);
+    CHECK(payload == NULL && payload_length == 0);
+    CHECK(credentials_serialize(collection, NULL, &payload_length) == 0);
+    CHECK(credentials_serialize(collection, &payload, NULL) == 0);
+    CHECK(credentials_deserialize(NULL, TEST_HEADER_BYTES, decoded) == 0);
+    CHECK(credentials_deserialize((const unsigned char *)"x",
+                                  VAULT_MAX_PLAINTEXT_BYTES + 1U,
+                                  decoded) == 0);
+    CHECK(credentials_deserialize((const unsigned char *)"x", 1,
+                                  decoded) == 0);
+    CHECK(credentials_deserialize((const unsigned char *)"SPMCREDS",
+                                  8, NULL) == 0);
+    credentials_cleanup(collection);
+    credentials_cleanup(decoded);
+    OPENSSL_cleanse(password, sizeof(password));
+    free(collection);
+    free(decoded);
+}
+
+static void test_record_limit(void)
+{
+    static const unsigned char label[] = "x";
+    struct credential_collection *collection = new_collection();
+    unsigned char id[CREDENTIALS_RECORD_ID_BYTES];
+    unsigned char previous[CREDENTIALS_RECORD_ID_BYTES] = {0};
+    unsigned char *payload = NULL;
+    size_t payload_length = 0;
+
+    CHECK(collection != NULL);
+    if (collection == NULL) {
+        return;
+    }
+    for (size_t index = 0; index < CREDENTIALS_MAX_RECORDS; ++index) {
+        CHECK(add_record(collection, label, sizeof(label) - 1,
+                         NULL, 0, NULL, 0, NULL, 0, id) == 1);
+        CHECK(credentials_find(collection, id, sizeof(id)) != NULL);
+        if (index != 0) {
+            CHECK(memcmp(id, previous, sizeof(id)) != 0);
+        }
+        memcpy(previous, id, sizeof(previous));
+    }
+    CHECK(collection->count == CREDENTIALS_MAX_RECORDS);
+    CHECK(add_record(collection, label, sizeof(label) - 1,
+                     NULL, 0, NULL, 0, NULL, 0, id) == 0);
+    CHECK(credentials_serialize(collection, &payload, &payload_length) == 1);
+    CHECK(payload_length <= VAULT_MAX_PLAINTEXT_BYTES);
+    credentials_serialized_free(payload, payload_length);
+    credentials_cleanup(collection);
+    free(collection);
+}
+
+static void expect_deserialize_error(const unsigned char *payload,
+                                     size_t payload_length)
+{
+    struct credential_collection *output = malloc(sizeof(*output));
+
+    CHECK(output != NULL);
+    if (output == NULL) {
+        return;
+    }
+    memset(output, 0x5a, sizeof(*output));
+    CHECK(credentials_deserialize(payload, payload_length, output) == 0);
+    CHECK(((unsigned char *)output)[0] == 0x5a);
+    OPENSSL_cleanse(output, sizeof(*output));
+    free(output);
+}
+
+static void test_malformed_payloads(void)
+{
+    static const unsigned char label_one[] = "one";
+    static const unsigned char label_two[] = "two";
+    static const unsigned char password[] = "dummy-password";
+    struct credential_collection *collection = new_collection();
+    unsigned char first_id[CREDENTIALS_RECORD_ID_BYTES];
+    unsigned char second_id[CREDENTIALS_RECORD_ID_BYTES];
+    unsigned char *payload = NULL;
+    unsigned char *mutated = NULL;
+    size_t payload_length = 0;
+    size_t second_offset;
+
+    CHECK(collection != NULL);
+    if (collection == NULL) {
+        return;
+    }
+    CHECK(add_record(collection, label_one, sizeof(label_one) - 1,
+                     NULL, 0, password, sizeof(password) - 1,
+                     NULL, 0, first_id) == 1);
+    CHECK(add_record(collection, label_two, sizeof(label_two) - 1,
+                     NULL, 0, NULL, 0,
+                     NULL, 0, second_id) == 1);
+    CHECK(credentials_serialize(collection, &payload, &payload_length) == 1);
+    mutated = OPENSSL_malloc(payload_length + 1);
+    CHECK(mutated != NULL);
+    if (payload == NULL || mutated == NULL) {
+        credentials_serialized_free(payload, payload_length);
+        OPENSSL_free(mutated);
+        credentials_cleanup(collection);
+        free(collection);
+        return;
+    }
+    for (size_t length = 0; length < payload_length; ++length) {
+        expect_deserialize_error(payload, length);
+    }
+    memcpy(mutated, payload, payload_length);
+    mutated[0] ^= 1;
+    expect_deserialize_error(mutated, payload_length);
+
+    memcpy(mutated, payload, payload_length);
+    write_u32(mutated + 8, CREDENTIALS_FORMAT_VERSION + 1);
+    expect_deserialize_error(mutated, payload_length);
+
+    memcpy(mutated, payload, payload_length);
+    write_u32(mutated + 12, CREDENTIALS_MAX_RECORDS + 1U);
+    expect_deserialize_error(mutated, payload_length);
+
+    for (size_t field = 0; field < 4; ++field) {
+        memcpy(mutated, payload, payload_length);
+        write_u32(mutated + 32 + field * 4, UINT32_MAX);
+        expect_deserialize_error(mutated, payload_length);
+    }
+    memcpy(mutated, payload, payload_length);
+    write_u32(mutated + 32, 0);
+    expect_deserialize_error(mutated, payload_length);
+
+    second_offset = TEST_HEADER_BYTES + TEST_RECORD_HEADER_BYTES +
+                    sizeof(label_one) - 1 + sizeof(password) - 1;
+    memcpy(mutated, payload, payload_length);
+    memcpy(mutated + second_offset, mutated + TEST_HEADER_BYTES,
+           CREDENTIALS_RECORD_ID_BYTES);
+    expect_deserialize_error(mutated, payload_length);
+
+    memcpy(mutated, payload, payload_length);
+    mutated[payload_length] = 0xa5;
+    expect_deserialize_error(mutated, payload_length + 1);
+
+    memcpy(collection->records[1].id, collection->records[0].id,
+           CREDENTIALS_RECORD_ID_BYTES);
+    OPENSSL_clear_free(mutated, payload_length + 1);
+    mutated = NULL;
+    credentials_serialized_free(payload, payload_length);
+    payload = (unsigned char *)1;
+    payload_length = 88;
+    CHECK(credentials_serialize(collection, &payload, &payload_length) == 0);
+    CHECK(payload == NULL && payload_length == 0);
+
+    collection->count = SIZE_MAX;
+    CHECK(credentials_serialize(collection, &payload, &payload_length) == 0);
+    collection->count = 1;
+    collection->records[0].label_length = SIZE_MAX;
+    CHECK(credentials_serialize(collection, &payload, &payload_length) == 0);
+    credentials_cleanup(collection);
+    free(collection);
+}
+
+static void test_secure_cleanup(void)
+{
+    static const unsigned char label[] = "cleanup";
+    static const unsigned char password[] = "sensitive-dummy-password";
+    struct credential_collection *collection = new_collection();
+    unsigned char id[CREDENTIALS_RECORD_ID_BYTES];
+
+    CHECK(collection != NULL);
+    if (collection == NULL) {
+        return;
+    }
+    CHECK(add_record(collection, label, sizeof(label) - 1,
+                     NULL, 0, password, sizeof(password) - 1,
+                     NULL, 0, id) == 1);
+    credentials_cleanup(collection);
+    CHECK(all_zero(collection, sizeof(*collection)));
+    credentials_cleanup(NULL);
+    credentials_serialized_free(NULL, 0);
+    free(collection);
+}
+
+static int make_path(char output[TEST_PATH_BYTES],
+                     const char *first, const char *second)
+{
+    int length = snprintf(output, TEST_PATH_BYTES, "%s/%s", first, second);
+    return length >= 0 && (size_t)length < TEST_PATH_BYTES;
+}
+
+static char *make_temporary_home(char home_template[TEST_PATH_BYTES])
+{
+    const char *temporary_parent = getenv("TMPDIR");
+    char *canonical_parent;
+    int path_ready;
+
+    if (temporary_parent == NULL || temporary_parent[0] == '\0') {
+        temporary_parent = "/tmp";
+    }
+    canonical_parent = realpath(temporary_parent, NULL);
+    if (canonical_parent == NULL) {
+        return NULL;
+    }
+    path_ready = make_path(home_template, canonical_parent,
+                           "securepm-credentials-test.XXXXXX");
+    free(canonical_parent);
+    if (!path_ready) {
+        return NULL;
+    }
+    return mkdtemp(home_template);
+}
+
+static int remove_tree(const char *path)
+{
+    struct stat status;
+    DIR *directory;
+    struct dirent *entry;
+    int success = 1;
+
+    if (lstat(path, &status) != 0) {
+        return errno == ENOENT;
+    }
+    if (!S_ISDIR(status.st_mode) || S_ISLNK(status.st_mode)) {
+        return unlink(path) == 0;
+    }
+    directory = opendir(path);
+    if (directory == NULL) {
+        return 0;
+    }
+    while ((entry = readdir(directory)) != NULL) {
+        char child[TEST_PATH_BYTES];
+
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (!make_path(child, path, entry->d_name) || !remove_tree(child)) {
+            success = 0;
+        }
+    }
+    if (closedir(directory) != 0) {
+        success = 0;
+    }
+    if (success && rmdir(path) != 0) {
+        success = 0;
+    }
+    return success;
+}
+
+static void vault_filename(const unsigned char user_id[USER_DB_USER_ID_BYTES],
+                           char filename[TEST_VAULT_FILENAME_BYTES])
+{
+    static const char hexadecimal[] = "0123456789abcdef";
+    size_t position = 0;
+
+    for (size_t index = 0; index < USER_DB_USER_ID_BYTES; ++index) {
+        filename[position++] = hexadecimal[user_id[index] >> 4];
+        filename[position++] = hexadecimal[user_id[index] & 0x0f];
+    }
+    memcpy(filename + position, ".vault", sizeof(".vault"));
+}
+
+static void test_vault_integration(void)
+{
+    static const unsigned char label[] = "integration service";
+    static const unsigned char username[] = "integration-user";
+    static const unsigned char password[] = "vault-only-dummy-password";
+    static const unsigned char notes[] = "dummy integration notes";
+    char master_password[] = "dummy-master-password-for-integration";
+    char home_template[TEST_PATH_BYTES];
+    char filename[TEST_VAULT_FILENAME_BYTES];
+    char *home = make_temporary_home(home_template);
+    struct storage storage = STORAGE_INITIALIZER;
+    struct account_session session = ACCOUNT_SESSION_INITIALIZER;
+    struct credential_collection *collection = new_collection();
+    struct credential_collection *decoded = new_collection();
+    unsigned char record_id[CREDENTIALS_RECORD_ID_BYTES];
+    unsigned char *serialized = NULL;
+    unsigned char *decrypted = NULL;
+    unsigned char *encrypted_file = NULL;
+    size_t serialized_length = 0;
+    size_t decrypted_length = 0;
+    size_t encrypted_length = 0;
+    int home_set;
+
+    CHECK(home != NULL && collection != NULL && decoded != NULL);
+    if (home == NULL || collection == NULL || decoded == NULL) {
+        if (home != NULL) {
+            CHECK(remove_tree(home));
+        }
+        free(collection);
+        free(decoded);
+        OPENSSL_cleanse(master_password, sizeof(master_password));
+        return;
+    }
+    home_set = setenv("HOME", home, 1) == 0;
+    CHECK(home_set);
+    if (!home_set) {
+        CHECK(remove_tree(home));
+        credentials_cleanup(collection);
+        credentials_cleanup(decoded);
+        free(collection);
+        free(decoded);
+        OPENSSL_cleanse(master_password, sizeof(master_password));
+        return;
+    }
+    CHECK(storage_init(&storage) == 1);
+    CHECK(account_register(&storage, "Integration", 11,
+                           master_password,
+                           sizeof(master_password) - 1) == 1);
+    CHECK(account_unlock(&storage, "Integration", 11,
+                         master_password, sizeof(master_password) - 1,
+                         &session) == 1);
+    CHECK(add_record(collection, label, sizeof(label) - 1,
+                     username, sizeof(username) - 1,
+                     password, sizeof(password) - 1,
+                     notes, sizeof(notes) - 1, record_id) == 1);
+    CHECK(credentials_serialize(collection, &serialized,
+                                &serialized_length) == 1);
+    CHECK(vault_write(&storage, &session,
+                      serialized, serialized_length) == 1);
+    vault_filename(session.user_id, filename);
+    CHECK(storage_read_file(&storage, STORAGE_AREA_VAULTS, filename,
+                            STORAGE_MAX_FILE_BYTES, &encrypted_file,
+                            &encrypted_length) == STORAGE_READ_OK);
+    CHECK(!contains_bytes(encrypted_file, encrypted_length,
+                          password, sizeof(password) - 1));
+    CHECK(!contains_bytes(encrypted_file, encrypted_length,
+                          username, sizeof(username) - 1));
+    storage_free(encrypted_file);
+    encrypted_file = NULL;
+    credentials_serialized_free(serialized, serialized_length);
+    serialized = NULL;
+    serialized_length = 0;
+    account_session_lock(&session);
+    storage_close(&storage);
+
+    CHECK(storage_init(&storage) == 1);
+    CHECK(account_unlock(&storage, "Integration", 11,
+                         master_password, sizeof(master_password) - 1,
+                         &session) == 1);
+    CHECK(vault_read(&storage, &session, &decrypted,
+                     &decrypted_length) == VAULT_READ_OK);
+    CHECK(credentials_deserialize(decrypted, decrypted_length, decoded) == 1);
+    CHECK(decoded->count == 1);
+    const struct credential_record *record =
+        credentials_find(decoded, record_id, sizeof(record_id));
+    CHECK(record != NULL);
+    if (record != NULL) {
+        CHECK(record->password_length == sizeof(password) - 1);
+        CHECK(memcmp(record->password, password,
+                     record->password_length) == 0);
+        CHECK(record->notes_length == sizeof(notes) - 1);
+        CHECK(memcmp(record->notes, notes, record->notes_length) == 0);
+    }
+
+    vault_secure_free(decrypted, decrypted_length);
+    credentials_serialized_free(serialized, serialized_length);
+    storage_free(encrypted_file);
+    credentials_cleanup(collection);
+    credentials_cleanup(decoded);
+    account_session_lock(&session);
+    storage_close(&storage);
+    OPENSSL_cleanse(master_password, sizeof(master_password));
+    free(collection);
+    free(decoded);
+    CHECK(remove_tree(home));
+}
+
+int main(void)
+{
+    test_empty_collection();
+    test_add_find_and_round_trip();
+    test_limits_and_invalid_inputs();
+    test_record_limit();
+    test_malformed_payloads();
+    test_secure_cleanup();
+    test_vault_integration();
+
+    if (failures != 0) {
+        fprintf(stderr, "FAIL: %u of %u credential checks\n",
+                failures, checks);
+        return 1;
+    }
+    printf("PASS: %u credential checks\n", checks);
+    return 0;
+}
