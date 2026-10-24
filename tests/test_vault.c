@@ -14,6 +14,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define TEST_PATH_BYTES 4096
@@ -156,6 +158,142 @@ static void write_u32_at(unsigned char *data, size_t offset, uint32_t value)
     data[offset + 1] = (unsigned char)(value >> 16);
     data[offset + 2] = (unsigned char)(value >> 8);
     data[offset + 3] = (unsigned char)value;
+}
+
+static int read_exact(int descriptor, void *buffer, size_t length)
+{
+    unsigned char *bytes = buffer;
+    size_t offset = 0;
+
+    while (offset < length) {
+        ssize_t count = read(descriptor, bytes + offset, length - offset);
+
+        if (count > 0) {
+            offset += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int write_exact(int descriptor, const void *buffer, size_t length)
+{
+    const unsigned char *bytes = buffer;
+    size_t offset = 0;
+
+    while (offset < length) {
+        ssize_t count = write(descriptor, bytes + offset, length - offset);
+
+        if (count > 0) {
+            offset += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int update_vault_in_child(const struct storage *storage,
+                                 const struct account_session *session,
+                                 int ready_fd, int start_fd,
+                                 unsigned char marker)
+{
+    struct storage_lock lock = STORAGE_LOCK_INITIALIZER;
+    unsigned char *current = NULL;
+    unsigned char *updated = NULL;
+    size_t current_length = 0;
+    char start;
+    struct timespec delay = {0, 100000000};
+    int success = 0;
+
+    if (!write_exact(ready_fd, "R", 1) ||
+        !read_exact(start_fd, &start, 1) ||
+        !vault_lock_acquire(storage, session, &lock) ||
+        vault_read(storage, session, &current, &current_length) !=
+            VAULT_READ_OK ||
+        current_length == SIZE_MAX) {
+        goto cleanup;
+    }
+    updated = malloc(current_length + 1);
+    if (updated == NULL) {
+        goto cleanup;
+    }
+    memcpy(updated, current, current_length);
+    updated[current_length] = marker;
+    (void)nanosleep(&delay, NULL);
+    success = vault_write(storage, session, updated, current_length + 1);
+
+cleanup:
+    vault_secure_free(current, current_length);
+    free(updated);
+    storage_lock_release(&lock);
+    return success;
+}
+
+static void test_concurrent_updates(const struct storage *storage,
+                                    const struct account_session *session)
+{
+    static const unsigned char initial[] = "base";
+    struct storage_lock lock = STORAGE_LOCK_INITIALIZER;
+    unsigned char *plaintext = NULL;
+    size_t plaintext_length = 0;
+    int ready_pipe[2] = {-1, -1};
+    int start_pipe[2] = {-1, -1};
+    pid_t children[2] = {-1, -1};
+    char ready[2];
+
+    CHECK(vault_write(storage, session, initial, sizeof(initial) - 1) == 1);
+    CHECK(pipe(ready_pipe) == 0);
+    CHECK(pipe(start_pipe) == 0);
+    if (ready_pipe[0] < 0 || start_pipe[0] < 0) {
+        return;
+    }
+    for (size_t index = 0; index < 2; ++index) {
+        children[index] = fork();
+        CHECK(children[index] >= 0);
+        if (children[index] == 0) {
+            int success;
+
+            close(ready_pipe[0]);
+            close(start_pipe[1]);
+            success = update_vault_in_child(storage, session,
+                                            ready_pipe[1], start_pipe[0],
+                                            (unsigned char)('A' + index));
+            _exit(success ? 0 : 1);
+        }
+    }
+    close(ready_pipe[1]);
+    close(start_pipe[0]);
+    CHECK(read_exact(ready_pipe[0], ready, sizeof(ready)));
+    CHECK(write_exact(start_pipe[1], "GG", 2));
+    for (size_t index = 0; index < 2; ++index) {
+        int status = 0;
+
+        if (children[index] > 0) {
+            CHECK(waitpid(children[index], &status, 0) == children[index]);
+            CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        }
+    }
+    close(ready_pipe[0]);
+    close(start_pipe[1]);
+    CHECK(vault_lock_acquire(storage, session, &lock) == 1);
+    CHECK(vault_read(storage, session, &plaintext,
+                     &plaintext_length) == VAULT_READ_OK);
+    CHECK(plaintext_length == sizeof(initial) + 1);
+    if (plaintext != NULL && plaintext_length == sizeof(initial) + 1) {
+        CHECK(memcmp(plaintext, initial, sizeof(initial) - 1) == 0);
+        CHECK(contains_bytes(plaintext, plaintext_length,
+                             (const unsigned char *)"A", 1));
+        CHECK(contains_bytes(plaintext, plaintext_length,
+                             (const unsigned char *)"B", 1));
+    }
+    vault_secure_free(plaintext, plaintext_length);
+    storage_lock_release(&lock);
 }
 
 static void test_locked_and_missing(const struct storage *storage,
@@ -441,6 +579,7 @@ int main(void)
         test_write_read_and_reopen(&storage, &session);
         test_file_format_and_replacement(&storage, &session,
                                          &valid_file, &valid_file_length);
+        test_concurrent_updates(&storage, &session);
         test_empty_vault(&storage);
         if (valid_file != NULL) {
             test_wrong_session_and_authenticated_header(

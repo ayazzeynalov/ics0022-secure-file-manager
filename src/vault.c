@@ -17,6 +17,8 @@
 #define VAULT_MAX_FILE_BYTES (VAULT_FIXED_BYTES + VAULT_MAX_PLAINTEXT_BYTES)
 #define VAULT_FILENAME_BYTES \
     (USER_DB_USER_ID_BYTES * 2 + sizeof(".vault"))
+#define VAULT_LOCK_FILENAME_BYTES \
+    (USER_DB_USER_ID_BYTES * 2 + sizeof(".lock"))
 
 static const unsigned char vault_magic[VAULT_MAGIC_BYTES] = {
     'S', 'P', 'M', 'V', 'A', 'U', 'L', 'T'
@@ -27,21 +29,45 @@ static int valid_session(const struct account_session *session)
     return session != NULL && session->unlocked == 1;
 }
 
-static int vault_filename(const unsigned char user_id[USER_DB_USER_ID_BYTES],
-                          char filename[VAULT_FILENAME_BYTES])
+static int user_file_name(const unsigned char user_id[USER_DB_USER_ID_BYTES],
+                          const char *suffix, size_t suffix_length,
+                          char *filename)
 {
     static const char hexadecimal[] = "0123456789abcdef";
     size_t position = 0;
 
-    if (user_id == NULL || filename == NULL) {
+    if (user_id == NULL || suffix == NULL || suffix_length == 0 ||
+        filename == NULL) {
         return 0;
     }
     for (size_t index = 0; index < USER_DB_USER_ID_BYTES; ++index) {
         filename[position++] = hexadecimal[user_id[index] >> 4];
         filename[position++] = hexadecimal[user_id[index] & 0x0f];
     }
-    memcpy(filename + position, ".vault", sizeof(".vault"));
+    memcpy(filename + position, suffix, suffix_length);
     return 1;
+}
+
+static int vault_filename(const unsigned char user_id[USER_DB_USER_ID_BYTES],
+                          char filename[VAULT_FILENAME_BYTES])
+{
+    return user_file_name(user_id, ".vault", sizeof(".vault"), filename);
+}
+
+int vault_lock_acquire(const struct storage *storage,
+                       const struct account_session *session,
+                       struct storage_lock *lock)
+{
+    char filename[VAULT_LOCK_FILENAME_BYTES];
+
+    if (storage == NULL || !valid_session(session) ||
+        !user_file_name(session->user_id, ".lock", sizeof(".lock"),
+                        filename)) {
+        errno = EINVAL;
+        return 0;
+    }
+    return storage_lock_acquire(storage, STORAGE_AREA_VAULTS,
+                                filename, lock);
 }
 
 static void write_u32(unsigned char output[4], uint32_t value)

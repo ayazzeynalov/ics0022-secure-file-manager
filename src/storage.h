@@ -24,6 +24,13 @@ struct storage {
 
 #define STORAGE_INITIALIZER { -1, -1 }
 
+struct storage_lock {
+    int descriptor;
+    int held;
+};
+
+#define STORAGE_LOCK_INITIALIZER { -1, 0 }
+
 /* Uses the absolute HOME environment path. Every path component must be a real
  * directory rather than a symlink, and HOME must be owned by the effective user.
  * Callers must initialize the context with STORAGE_INITIALIZER. */
@@ -45,5 +52,11 @@ void storage_free(void *data);
 int storage_atomic_write(const struct storage *storage, enum storage_area area,
                          const char *filename,
                          const unsigned char *data, size_t data_length);
+
+/* Lock files are stable objects and are never replaced by atomic writes. */
+int storage_lock_acquire(const struct storage *storage, enum storage_area area,
+                         const char *filename, struct storage_lock *lock);
+int storage_lock_is_held(const struct storage_lock *lock);
+void storage_lock_release(struct storage_lock *lock);
 
 #endif

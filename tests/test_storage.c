@@ -9,6 +9,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define TEST_PATH_BYTES 4096
@@ -397,6 +399,68 @@ static void test_failed_write_cleanup(const struct storage *storage,
     }
 }
 
+static void test_locking(const struct storage *storage, const char *home)
+{
+    struct storage_lock lock = STORAGE_LOCK_INITIALIZER;
+    char root[TEST_PATH_BYTES];
+    char lock_path[TEST_PATH_BYTES];
+    int ready_pipe[2] = {-1, -1};
+    int acquired_pipe[2] = {-1, -1};
+    struct pollfd poll_descriptor;
+    pid_t child = -1;
+    char byte;
+    int status = 0;
+
+    CHECK(storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                               "concurrent.lock", &lock) == 1);
+    CHECK(storage_lock_is_held(&lock));
+    CHECK(make_path(root, home, ".securepm"));
+    CHECK(make_path(lock_path, root, "concurrent.lock"));
+    check_mode(lock_path, STORAGE_FILE_MODE, 0);
+    CHECK(pipe(ready_pipe) == 0);
+    CHECK(pipe(acquired_pipe) == 0);
+    if (ready_pipe[0] < 0 || acquired_pipe[0] < 0) {
+        storage_lock_release(&lock);
+        return;
+    }
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        struct storage_lock child_lock = STORAGE_LOCK_INITIALIZER;
+
+        close(ready_pipe[0]);
+        close(acquired_pipe[0]);
+        if (write(ready_pipe[1], "R", 1) != 1 ||
+            !storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                                  "concurrent.lock", &child_lock) ||
+            write(acquired_pipe[1], "A", 1) != 1) {
+            _exit(1);
+        }
+        storage_lock_release(&child_lock);
+        _exit(0);
+    }
+    close(ready_pipe[1]);
+    close(acquired_pipe[1]);
+    ready_pipe[1] = -1;
+    acquired_pipe[1] = -1;
+    if (child > 0) {
+        CHECK(read(ready_pipe[0], &byte, 1) == 1 && byte == 'R');
+        poll_descriptor.fd = acquired_pipe[0];
+        poll_descriptor.events = POLLIN;
+        poll_descriptor.revents = 0;
+        CHECK(poll(&poll_descriptor, 1, 200) == 0);
+        storage_lock_release(&lock);
+        CHECK(poll(&poll_descriptor, 1, 5000) == 1);
+        CHECK(read(acquired_pipe[0], &byte, 1) == 1 && byte == 'A');
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    storage_lock_release(&lock);
+    close(ready_pipe[0]);
+    close(acquired_pipe[0]);
+    CHECK(!storage_lock_is_held(&lock));
+}
+
 int main(void)
 {
     char home_template[TEST_PATH_BYTES];
@@ -423,6 +487,7 @@ int main(void)
         test_symlink_and_unsafe_objects(&storage, home);
         test_oversized_file(&storage, home);
         test_failed_write_cleanup(&storage, home);
+        test_locking(&storage, home);
     }
     storage_close(&storage);
     CHECK(remove_tree(home));

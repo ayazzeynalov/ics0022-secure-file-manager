@@ -329,6 +329,7 @@ static int login_user(const struct storage *storage)
     char username[USER_DB_USERNAME_MAX_BYTES + 1];
     char password[CRYPTO_PASSWORD_MAX_BYTES + 1];
     struct account_session session = ACCOUNT_SESSION_INITIALIZER;
+    struct storage_lock vault_lock = STORAGE_LOCK_INITIALIZER;
     struct credential_collection *collection = NULL;
     unsigned char *payload = NULL;
     size_t username_length = 0;
@@ -357,7 +358,8 @@ static int login_user(const struct storage *storage)
     }
     OPENSSL_cleanse(password, sizeof(password));
     password_length = 0;
-    if (vault_read(storage, &session, &payload, &payload_length) !=
+    if (!vault_lock_acquire(storage, &session, &vault_lock) ||
+        vault_read(storage, &session, &payload, &payload_length) !=
         VAULT_READ_OK) {
         puts("Login failed.");
         goto cleanup;
@@ -387,6 +389,7 @@ cleanup:
         free(collection);
     }
     account_session_lock(&session);
+    storage_lock_release(&vault_lock);
     return action;
 }
 

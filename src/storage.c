@@ -489,3 +489,102 @@ cleanup:
     }
     return success;
 }
+
+static int open_lock_file(int directory_fd, const char *filename)
+{
+    int created = 0;
+    int file_fd;
+
+    file_fd = openat(directory_fd, filename,
+                     O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                     STORAGE_FILE_MODE);
+    if (file_fd >= 0) {
+        created = 1;
+    } else if (errno == EEXIST) {
+        file_fd = openat(directory_fd, filename,
+                         O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    }
+    if (file_fd < 0) {
+        return -1;
+    }
+    {
+        struct stat status;
+
+        if ((created && fchmod(file_fd, STORAGE_FILE_MODE) != 0) ||
+            fstat(file_fd, &status) != 0 || !secure_file_stat(&status) ||
+            (created && (!sync_file(file_fd) ||
+                         !sync_directory(directory_fd)))) {
+            int saved_errno = errno;
+
+            close(file_fd);
+            if (created) {
+                unlinkat(directory_fd, filename, 0);
+            }
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    return file_fd;
+}
+
+int storage_lock_acquire(const struct storage *storage, enum storage_area area,
+                         const char *filename, struct storage_lock *lock)
+{
+    struct flock operation = {0};
+    int directory_fd;
+    int file_fd;
+    int result;
+
+    if (lock == NULL || lock->held) {
+        errno = EINVAL;
+        return 0;
+    }
+    directory_fd = area_fd(storage, area);
+    if (directory_fd < 0 || !valid_filename(filename)) {
+        errno = EINVAL;
+        return 0;
+    }
+    file_fd = open_lock_file(directory_fd, filename);
+    if (file_fd < 0) {
+        return 0;
+    }
+    operation.l_type = F_WRLCK;
+    operation.l_whence = SEEK_SET;
+    do {
+        result = fcntl(file_fd, F_SETLKW, &operation);
+    } while (result != 0 && errno == EINTR);
+    if (result != 0) {
+        int saved_errno = errno;
+
+        close(file_fd);
+        errno = saved_errno;
+        return 0;
+    }
+    lock->descriptor = file_fd;
+    lock->held = 1;
+    return 1;
+}
+
+int storage_lock_is_held(const struct storage_lock *lock)
+{
+    return lock != NULL && lock->held == 1 && lock->descriptor >= 0;
+}
+
+void storage_lock_release(struct storage_lock *lock)
+{
+    int saved_errno = errno;
+
+    if (storage_lock_is_held(lock)) {
+        struct flock operation = {0};
+
+        operation.l_type = F_UNLCK;
+        operation.l_whence = SEEK_SET;
+        (void)fcntl(lock->descriptor, F_SETLK, &operation);
+        (void)close(lock->descriptor);
+    }
+    if (lock != NULL) {
+        lock->descriptor = -1;
+        lock->held = 0;
+    }
+    errno = saved_errno;
+}

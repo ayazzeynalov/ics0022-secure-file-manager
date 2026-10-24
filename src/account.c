@@ -7,6 +7,7 @@
 #include <openssl/crypto.h>
 
 #define ACCOUNT_USER_ID_ATTEMPTS 128
+#define ACCOUNT_DATABASE_LOCK "users.lock"
 
 static int valid_credentials(const char *username, size_t username_length,
                              const char *password, size_t password_length,
@@ -53,6 +54,7 @@ int account_register(const struct storage *storage,
     struct crypto_keys keys = {0};
     unsigned char root[CRYPTO_KEY_BYTES] = {0};
     unsigned char vmk[AUTH_VMK_BYTES] = {0};
+    struct storage_lock database_lock = STORAGE_LOCK_INITIALIZER;
     int success = 0;
 
     user_db_init(&database);
@@ -64,7 +66,9 @@ int account_register(const struct storage *storage,
         errno = EINVAL;
         goto cleanup;
     }
-    if (!user_db_load(storage, &database) ||
+    if (!storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                              ACCOUNT_DATABASE_LOCK, &database_lock) ||
+        !user_db_load(storage, &database) ||
         database.count == USER_DB_MAX_USERS ||
         user_db_find_username(&database, username, username_length) != NULL) {
         goto cleanup;
@@ -111,6 +115,7 @@ int account_register(const struct storage *storage,
     success = 1;
 
 cleanup:
+    storage_lock_release(&database_lock);
     OPENSSL_cleanse(vmk, sizeof(vmk));
     OPENSSL_cleanse(&keys, sizeof(keys));
     OPENSSL_cleanse(root, sizeof(root));

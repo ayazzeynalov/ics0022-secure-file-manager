@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <openssl/crypto.h>
 
@@ -28,6 +29,44 @@ static unsigned int failures;
         ++failures; \
     } \
 } while (0)
+
+static int read_exact(int descriptor, void *buffer, size_t length)
+{
+    unsigned char *bytes = buffer;
+    size_t offset = 0;
+
+    while (offset < length) {
+        ssize_t count = read(descriptor, bytes + offset, length - offset);
+
+        if (count > 0) {
+            offset += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int write_exact(int descriptor, const void *buffer, size_t length)
+{
+    const unsigned char *bytes = buffer;
+    size_t offset = 0;
+
+    while (offset < length) {
+        ssize_t count = write(descriptor, bytes + offset, length - offset);
+
+        if (count > 0) {
+            offset += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
 
 static int make_path(char output[TEST_PATH_BYTES],
                      const char *first, const char *second)
@@ -229,19 +268,61 @@ static void test_registration(const struct storage *storage,
                               struct user_record *alice_record)
 {
     struct user_database database;
+    int ready_pipe[2] = {-1, -1};
+    int start_pipe[2] = {-1, -1};
+    pid_t children[2] = {-1, -1};
+    int statuses[2] = {0, 0};
+    char ready[2];
 
-    CHECK(account_register(storage, "Alice", 5,
-                           alice_password, alice_password_length) == 1);
+    CHECK(pipe(ready_pipe) == 0);
+    CHECK(pipe(start_pipe) == 0);
+    if (ready_pipe[0] < 0 || start_pipe[0] < 0) {
+        return;
+    }
+    for (size_t index = 0; index < 2; ++index) {
+        children[index] = fork();
+        CHECK(children[index] >= 0);
+        if (children[index] == 0) {
+            const char *name = index == 0 ? "Alice" : "Carol";
+            const char *password = index == 0 ? alice_password : carol_password;
+            size_t length = index == 0 ? alice_password_length :
+                                         carol_password_length;
+            char start;
+
+            close(ready_pipe[0]);
+            close(start_pipe[1]);
+            if (!write_exact(ready_pipe[1], "R", 1) ||
+                !read_exact(start_pipe[0], &start, 1) ||
+                !account_register(storage, name, 5, password, length)) {
+                _exit(1);
+            }
+            _exit(0);
+        }
+    }
+    close(ready_pipe[1]);
+    close(start_pipe[0]);
+    ready_pipe[1] = -1;
+    start_pipe[0] = -1;
+    CHECK(read_exact(ready_pipe[0], ready, sizeof(ready)));
+    CHECK(write_exact(start_pipe[1], "GG", 2));
+    for (size_t index = 0; index < 2; ++index) {
+        if (children[index] > 0) {
+            CHECK(waitpid(children[index], &statuses[index], 0) ==
+                  children[index]);
+            CHECK(WIFEXITED(statuses[index]) &&
+                  WEXITSTATUS(statuses[index]) == 0);
+        }
+    }
+    close(ready_pipe[0]);
+    close(start_pipe[1]);
     CHECK(account_register(storage, "Alice", 5,
                            carol_password, carol_password_length) == 0);
-    CHECK(account_register(storage, "Carol", 5,
-                           carol_password, carol_password_length) == 1);
 
     user_db_init(&database);
     CHECK(user_db_load(storage, &database) == 1);
     CHECK(database.count == 2);
-    CHECK(strcmp(database.records[0].username, "Alice") == 0);
-    CHECK(strcmp(database.records[1].username, "Carol") == 0);
+    CHECK(user_db_find_username(&database, "Alice", 5) != NULL);
+    CHECK(user_db_find_username(&database, "Carol", 5) != NULL);
     CHECK(memcmp(database.records[0].user_id, database.records[1].user_id,
                  USER_DB_USER_ID_BYTES) != 0);
     CHECK(memcmp(database.records[0].salt, database.records[1].salt,
@@ -251,7 +332,7 @@ static void test_registration(const struct storage *storage,
     CHECK(database.records[0].scrypt.p == crypto_scrypt_defaults.p);
     CHECK(database.records[0].scrypt.max_memory ==
           crypto_scrypt_defaults.max_memory);
-    *alice_record = database.records[0];
+    *alice_record = *user_db_find_username(&database, "Alice", 5);
 }
 
 static void test_unlock_and_no_plaintext(
@@ -314,12 +395,20 @@ static void test_corrupted_record(
     struct account_session *session)
 {
     struct user_database database;
+    const struct user_record *stored_alice;
+    size_t alice_index;
 
     user_db_init(&database);
     CHECK(user_db_load(storage, &database) == 1);
     CHECK(database.count == 2);
+    stored_alice = user_db_find_username(&database, "Alice", 5);
+    CHECK(stored_alice != NULL);
+    if (stored_alice == NULL) {
+        return;
+    }
+    alice_index = (size_t)(stored_alice - database.records);
 
-    database.records[0].authentication_verifier[0] ^= 1;
+    database.records[alice_index].authentication_verifier[0] ^= 1;
     CHECK(user_db_save(storage, &database) == 1);
     memset(session, 0xa5, sizeof(*session));
     session->unlocked = 1;
@@ -328,8 +417,8 @@ static void test_corrupted_record(
                          session) == 0);
     check_locked(session);
 
-    database.records[0] = *alice_record;
-    database.records[0].wrapped_vmk[0] ^= 1;
+    database.records[alice_index] = *alice_record;
+    database.records[alice_index].wrapped_vmk[0] ^= 1;
     CHECK(user_db_save(storage, &database) == 1);
     memset(session, 0xa5, sizeof(*session));
     session->unlocked = 1;
@@ -338,7 +427,7 @@ static void test_corrupted_record(
                          session) == 0);
     check_locked(session);
 
-    database.records[0] = *alice_record;
+    database.records[alice_index] = *alice_record;
     CHECK(user_db_save(storage, &database) == 1);
     CHECK(account_unlock(storage, "Alice", 5,
                          alice_password, alice_password_length,
