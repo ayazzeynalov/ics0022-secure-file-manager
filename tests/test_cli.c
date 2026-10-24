@@ -299,7 +299,11 @@ static int wait_for_exit(pid_t child, int master, int *status)
         if (poll(&descriptor, 1, 50) > 0 &&
             (descriptor.revents & POLLIN) != 0) {
             unsigned char discarded[1024];
-            (void)read(master, discarded, sizeof(discarded));
+            ssize_t received = read(master, discarded, sizeof(discarded));
+
+            if (received < 0 && errno != EINTR) {
+                return 0;
+            }
         }
     }
     (void)kill(child, SIGKILL);
