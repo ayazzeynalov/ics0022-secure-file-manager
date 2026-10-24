@@ -229,6 +229,7 @@ static void test_update_and_delete(void)
     unsigned char second_id[CREDENTIALS_RECORD_ID_BYTES];
     unsigned char stable_id[CREDENTIALS_RECORD_ID_BYTES];
     unsigned char missing_id[CREDENTIALS_RECORD_ID_BYTES] = {0};
+    struct credential_collection *before_failed_update = NULL;
     const struct credential_record *record;
 
     CHECK(collection != NULL);
@@ -274,6 +275,11 @@ static void test_update_and_delete(void)
     CHECK(credentials_update(collection, first_id, sizeof(first_id) - 1,
                              new_label, sizeof(new_label) - 1,
                              NULL, 0, NULL, 0, NULL, 0) == 0);
+    before_failed_update = malloc(sizeof(*before_failed_update));
+    CHECK(before_failed_update != NULL);
+    if (before_failed_update != NULL) {
+        memcpy(before_failed_update, collection, sizeof(*collection));
+    }
     CHECK(credentials_update(collection, first_id, sizeof(first_id),
                              NULL, 0, NULL, 0, NULL, 0, NULL, 0) == 0);
     CHECK(credentials_update(collection, first_id, sizeof(first_id),
@@ -281,6 +287,12 @@ static void test_update_and_delete(void)
                              NULL, 0, new_password,
                              CREDENTIALS_PASSWORD_MAX_BYTES + 1U,
                              NULL, 0) == 0);
+    if (before_failed_update != NULL) {
+        CHECK(memcmp(before_failed_update, collection,
+                     sizeof(*collection)) == 0);
+        credentials_cleanup(before_failed_update);
+        free(before_failed_update);
+    }
     record = credentials_find(collection, first_id, sizeof(first_id));
     CHECK(record != NULL && record->password_length == sizeof(new_password));
 
