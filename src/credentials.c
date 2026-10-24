@@ -92,6 +92,97 @@ const struct credential_record *credentials_find(
     return NULL;
 }
 
+static struct credential_record *find_mutable_record(
+    struct credential_collection *collection,
+    const unsigned char *record_id, size_t record_id_length)
+{
+    if (collection == NULL || record_id == NULL ||
+        record_id_length != CREDENTIALS_RECORD_ID_BYTES ||
+        collection->count > CREDENTIALS_MAX_RECORDS) {
+        return NULL;
+    }
+    for (size_t index = 0; index < collection->count; ++index) {
+        if (memcmp(collection->records[index].id, record_id,
+                   CREDENTIALS_RECORD_ID_BYTES) == 0) {
+            return &collection->records[index];
+        }
+    }
+    return NULL;
+}
+
+int credentials_update(struct credential_collection *collection,
+                       const unsigned char *record_id,
+                       size_t record_id_length,
+                       const unsigned char *label, size_t label_length,
+                       const unsigned char *username, size_t username_length,
+                       const unsigned char *password, size_t password_length,
+                       const unsigned char *notes, size_t notes_length)
+{
+    struct credential_record replacement;
+    struct credential_record *record;
+
+    if (!valid_field(label, label_length,
+                     CREDENTIALS_LABEL_MAX_BYTES, 1) ||
+        !valid_field(username, username_length,
+                     CREDENTIALS_USERNAME_MAX_BYTES, 0) ||
+        !valid_field(password, password_length,
+                     CREDENTIALS_PASSWORD_MAX_BYTES, 0) ||
+        !valid_field(notes, notes_length,
+                     CREDENTIALS_NOTES_MAX_BYTES, 0)) {
+        errno = EINVAL;
+        return 0;
+    }
+    record = find_mutable_record(collection, record_id, record_id_length);
+    if (record == NULL) {
+        errno = EINVAL;
+        return 0;
+    }
+    memset(&replacement, 0, sizeof(replacement));
+    memcpy(replacement.id, record->id, sizeof(replacement.id));
+    replacement.label_length = label_length;
+    memcpy(replacement.label, label, label_length);
+    replacement.username_length = username_length;
+    if (username_length != 0) {
+        memcpy(replacement.username, username, username_length);
+    }
+    replacement.password_length = password_length;
+    if (password_length != 0) {
+        memcpy(replacement.password, password, password_length);
+    }
+    replacement.notes_length = notes_length;
+    if (notes_length != 0) {
+        memcpy(replacement.notes, notes, notes_length);
+    }
+    OPENSSL_cleanse(record, sizeof(*record));
+    memcpy(record, &replacement, sizeof(*record));
+    OPENSSL_cleanse(&replacement, sizeof(replacement));
+    return 1;
+}
+
+int credentials_delete(struct credential_collection *collection,
+                       const unsigned char *record_id,
+                       size_t record_id_length)
+{
+    struct credential_record *record;
+    size_t index;
+
+    record = find_mutable_record(collection, record_id, record_id_length);
+    if (record == NULL) {
+        errno = EINVAL;
+        return 0;
+    }
+    index = (size_t)(record - collection->records);
+    OPENSSL_cleanse(record, sizeof(*record));
+    if (index + 1 < collection->count) {
+        memmove(record, record + 1,
+                (collection->count - index - 1) * sizeof(*record));
+    }
+    --collection->count;
+    OPENSSL_cleanse(&collection->records[collection->count],
+                    sizeof(collection->records[collection->count]));
+    return 1;
+}
+
 static int generate_unique_id(const struct credential_collection *collection,
                               unsigned char id[CREDENTIALS_RECORD_ID_BYTES])
 {

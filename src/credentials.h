@@ -45,6 +45,21 @@ const struct credential_record *credentials_find(
     const struct credential_collection *collection,
     const unsigned char *record_id, size_t record_id_length);
 
+/* Updates fields while preserving the record ID. Label is required; the
+ * remaining fields may be empty. Replaced field data is securely cleared. */
+int credentials_update(struct credential_collection *collection,
+                       const unsigned char *record_id,
+                       size_t record_id_length,
+                       const unsigned char *label, size_t label_length,
+                       const unsigned char *username, size_t username_length,
+                       const unsigned char *password, size_t password_length,
+                       const unsigned char *notes, size_t notes_length);
+
+/* Removes the matching record and securely clears its data. */
+int credentials_delete(struct credential_collection *collection,
+                       const unsigned char *record_id,
+                       size_t record_id_length);
+
 /* Serialized payloads contain plaintext credential data and are intended only
  * for immediate use with vault_write(). Release them with the exact returned
  * length through credentials_serialized_free(). */

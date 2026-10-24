@@ -215,6 +215,125 @@ static void test_add_find_and_round_trip(void)
     free(decoded);
 }
 
+static void test_update_and_delete(void)
+{
+    static const unsigned char first_label[] = "first";
+    static const unsigned char first_password[] = "old-secret-value";
+    static const unsigned char second_label[] = "second";
+    static const unsigned char new_label[] = "updated";
+    static const unsigned char new_username[] = "new-user";
+    static const unsigned char new_password[] = {0x00, 'n', 'e', 'w', 0xff};
+    static const unsigned char new_notes[] = "new notes";
+    struct credential_collection *collection = new_collection();
+    unsigned char first_id[CREDENTIALS_RECORD_ID_BYTES];
+    unsigned char second_id[CREDENTIALS_RECORD_ID_BYTES];
+    unsigned char stable_id[CREDENTIALS_RECORD_ID_BYTES];
+    unsigned char missing_id[CREDENTIALS_RECORD_ID_BYTES] = {0};
+    const struct credential_record *record;
+
+    CHECK(collection != NULL);
+    if (collection == NULL) {
+        return;
+    }
+    CHECK(add_record(collection, first_label, sizeof(first_label) - 1,
+                     NULL, 0, first_password, sizeof(first_password) - 1,
+                     NULL, 0, first_id) == 1);
+    CHECK(add_record(collection, second_label, sizeof(second_label) - 1,
+                     NULL, 0, NULL, 0, NULL, 0, second_id) == 1);
+    memcpy(stable_id, first_id, sizeof(stable_id));
+
+    CHECK(credentials_update(collection, first_id, sizeof(first_id),
+                             new_label, sizeof(new_label) - 1,
+                             new_username, sizeof(new_username) - 1,
+                             new_password, sizeof(new_password),
+                             new_notes, sizeof(new_notes) - 1) == 1);
+    CHECK(collection->count == 2);
+    record = credentials_find(collection, first_id, sizeof(first_id));
+    CHECK(record != NULL);
+    if (record != NULL) {
+        CHECK(memcmp(record->id, stable_id, sizeof(stable_id)) == 0);
+        CHECK(record->label_length == sizeof(new_label) - 1);
+        CHECK(memcmp(record->label, new_label,
+                     sizeof(new_label) - 1) == 0);
+        CHECK(record->username_length == sizeof(new_username) - 1);
+        CHECK(memcmp(record->username, new_username,
+                     sizeof(new_username) - 1) == 0);
+        CHECK(record->password_length == sizeof(new_password));
+        CHECK(memcmp(record->password, new_password,
+                     sizeof(new_password)) == 0);
+        CHECK(record->notes_length == sizeof(new_notes) - 1);
+        CHECK(memcmp(record->notes, new_notes,
+                     sizeof(new_notes) - 1) == 0);
+        CHECK(!contains_bytes((const unsigned char *)record, sizeof(*record),
+                              first_password,
+                              sizeof(first_password) - 1));
+    }
+    CHECK(credentials_update(collection, missing_id, sizeof(missing_id),
+                             new_label, sizeof(new_label) - 1,
+                             NULL, 0, NULL, 0, NULL, 0) == 0);
+    CHECK(credentials_update(collection, first_id, sizeof(first_id) - 1,
+                             new_label, sizeof(new_label) - 1,
+                             NULL, 0, NULL, 0, NULL, 0) == 0);
+    CHECK(credentials_update(collection, first_id, sizeof(first_id),
+                             NULL, 0, NULL, 0, NULL, 0, NULL, 0) == 0);
+    CHECK(credentials_update(collection, first_id, sizeof(first_id),
+                             new_label, sizeof(new_label) - 1,
+                             NULL, 0, new_password,
+                             CREDENTIALS_PASSWORD_MAX_BYTES + 1U,
+                             NULL, 0) == 0);
+    record = credentials_find(collection, first_id, sizeof(first_id));
+    CHECK(record != NULL && record->password_length == sizeof(new_password));
+
+    CHECK(credentials_delete(collection, first_id, sizeof(first_id)) == 1);
+    CHECK(collection->count == 1);
+    CHECK(credentials_find(collection, first_id, sizeof(first_id)) == NULL);
+    record = credentials_find(collection, second_id, sizeof(second_id));
+    CHECK(record == &collection->records[0]);
+    CHECK(all_zero(&collection->records[1], sizeof(collection->records[1])));
+    CHECK(credentials_delete(collection, first_id, sizeof(first_id)) == 0);
+    CHECK(credentials_delete(collection, second_id, sizeof(second_id) - 1) == 0);
+    CHECK(credentials_delete(NULL, second_id, sizeof(second_id)) == 0);
+    CHECK(credentials_delete(collection, second_id, sizeof(second_id)) == 1);
+    CHECK(collection->count == 0);
+    CHECK(all_zero(&collection->records[0], sizeof(collection->records[0])));
+
+    credentials_cleanup(collection);
+    free(collection);
+}
+
+static void test_collection_isolation(void)
+{
+    static const unsigned char label[] = "isolated";
+    static const unsigned char changed[] = "changed";
+    struct credential_collection *first = new_collection();
+    struct credential_collection *second = new_collection();
+    unsigned char first_id[CREDENTIALS_RECORD_ID_BYTES];
+    unsigned char second_id[CREDENTIALS_RECORD_ID_BYTES];
+
+    CHECK(first != NULL && second != NULL);
+    if (first == NULL || second == NULL) {
+        free(first);
+        free(second);
+        return;
+    }
+    CHECK(add_record(first, label, sizeof(label) - 1,
+                     NULL, 0, NULL, 0, NULL, 0, first_id) == 1);
+    CHECK(add_record(second, label, sizeof(label) - 1,
+                     NULL, 0, NULL, 0, NULL, 0, second_id) == 1);
+    CHECK(credentials_find(second, first_id, sizeof(first_id)) == NULL);
+    CHECK(credentials_update(second, first_id, sizeof(first_id),
+                             changed, sizeof(changed) - 1,
+                             NULL, 0, NULL, 0, NULL, 0) == 0);
+    CHECK(credentials_delete(second, first_id, sizeof(first_id)) == 0);
+    CHECK(second->count == 1);
+    CHECK(credentials_find(second, second_id, sizeof(second_id)) != NULL);
+
+    credentials_cleanup(first);
+    credentials_cleanup(second);
+    free(first);
+    free(second);
+}
+
 static void test_limits_and_invalid_inputs(void)
 {
     struct credential_collection *collection = new_collection();
@@ -842,6 +961,8 @@ int main(void)
 {
     test_empty_collection();
     test_add_find_and_round_trip();
+    test_update_and_delete();
+    test_collection_isolation();
     test_limits_and_invalid_inputs();
     test_record_limit();
     test_malformed_payloads();
