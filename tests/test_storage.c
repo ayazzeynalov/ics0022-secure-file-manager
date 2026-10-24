@@ -238,6 +238,10 @@ static void test_missing_and_names(const struct storage *storage)
     CHECK(read_data != NULL && read_length == 0);
     storage_free(read_data);
     read_data = NULL;
+    CHECK(storage_remove_file(storage, STORAGE_AREA_ROOT, "empty.db") == 1);
+    CHECK(storage_read_file(storage, STORAGE_AREA_ROOT, "empty.db", 0,
+                            &read_data, &read_length) == STORAGE_READ_MISSING);
+    CHECK(storage_remove_file(storage, STORAGE_AREA_ROOT, "empty.db") == 0);
     CHECK(storage_read_file(storage, STORAGE_AREA_ROOT, "users.db", 1,
                             &read_data, &read_length) == STORAGE_READ_ERROR);
     CHECK(read_data == NULL && read_length == 0);
@@ -298,6 +302,7 @@ static void test_symlink_and_unsafe_objects(const struct storage *storage,
                             &read_data, &read_length) == STORAGE_READ_ERROR);
     CHECK(storage_atomic_write(storage, STORAGE_AREA_ROOT, "link.db",
                                replacement, sizeof(replacement) - 1) == 0);
+    CHECK(storage_remove_file(storage, STORAGE_AREA_ROOT, "link.db") == 0);
     file_fd = open(outside, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     CHECK(file_fd >= 0);
     CHECK(read(file_fd, direct_buffer, sizeof(original) - 1) ==

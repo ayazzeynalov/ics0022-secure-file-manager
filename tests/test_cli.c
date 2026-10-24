@@ -530,7 +530,20 @@ static void test_registration_vault_failure(const char *program)
     }
     CHECK(vaults_path[0] != '\0' && chmod(vaults_path, 0700) == 0);
     if (success) {
+        CHECK(!find_vault(home, vault_path));
         success = wait_for_text(master, &transcript, "Choice: ") &&
+                  write_all(master, "1\n") &&
+                  wait_for_text(master, &transcript, "Username: ") &&
+                  write_all(master, "Incomplete\n") &&
+                  wait_for_text(master, &transcript, "Master password: ") &&
+                  write_all(master,
+                            "dummy-incomplete-registration-password\n") &&
+                  wait_for_text(master, &transcript,
+                                "Confirm master password: ") &&
+                  write_all(master,
+                            "dummy-incomplete-registration-password\n") &&
+                  wait_for_text(master, &transcript, "User created.") &&
+                  wait_for_text(master, &transcript, "Choice: ") &&
                   write_all(master, "3\n") &&
                   wait_for_exit(child, master, &status) &&
                   WIFEXITED(status) && WEXITSTATUS(status) == 0;
@@ -546,7 +559,7 @@ static void test_registration_vault_failure(const char *program)
     CHECK(!contains_bytes(transcript.data, transcript.length,
                           (const unsigned char *)password,
                           sizeof(password) - 1));
-    CHECK(!find_vault(home, vault_path));
+    CHECK(find_vault(home, vault_path));
     CHECK(remove_tree(home));
 }
 

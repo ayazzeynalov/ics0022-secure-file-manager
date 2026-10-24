@@ -198,6 +198,9 @@ static void test_invalid_inputs(const struct storage *storage,
     CHECK(account_unlock(NULL, "Alice", 5, password, password_length,
                          &session) == 0);
     check_locked(&session);
+    CHECK(account_registration_complete(NULL, &session) == 0);
+    CHECK(account_registration_complete(storage, NULL) == 0);
+    CHECK(account_registration_complete(storage, &session) == 0);
     account_session_lock(NULL);
     OPENSSL_cleanse(short_password, sizeof(short_password));
     OPENSSL_cleanse(oversized_password, sizeof(oversized_password));
@@ -317,6 +320,9 @@ static void test_registration(const struct storage *storage,
     close(start_pipe[1]);
     CHECK(account_register(storage, "Alice", 5,
                            carol_password, carol_password_length) == 0);
+    CHECK(account_register(storage, "Alice", 5,
+                           alice_password, alice_password_length) ==
+          ACCOUNT_REGISTER_RECOVERY);
 
     user_db_init(&database);
     CHECK(user_db_load(storage, &database) == 1);

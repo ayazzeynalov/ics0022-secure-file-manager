@@ -490,6 +490,25 @@ cleanup:
     return success;
 }
 
+int storage_remove_file(const struct storage *storage, enum storage_area area,
+                        const char *filename)
+{
+    struct stat status;
+    int directory_fd = area_fd(storage, area);
+
+    if (directory_fd < 0 || !valid_filename(filename)) {
+        errno = EINVAL;
+        return 0;
+    }
+    if (fstatat(directory_fd, filename, &status, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !secure_file_stat(&status) ||
+        unlinkat(directory_fd, filename, 0) != 0 ||
+        !sync_directory(directory_fd)) {
+        return 0;
+    }
+    return 1;
+}
+
 static int open_lock_file(int directory_fd, const char *filename)
 {
     int created = 0;

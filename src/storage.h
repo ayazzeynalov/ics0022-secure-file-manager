@@ -52,6 +52,8 @@ void storage_free(void *data);
 int storage_atomic_write(const struct storage *storage, enum storage_area area,
                          const char *filename,
                          const unsigned char *data, size_t data_length);
+int storage_remove_file(const struct storage *storage, enum storage_area area,
+                        const char *filename);
 
 /* Lock files are stable objects and are never replaced by atomic writes. */
 int storage_lock_acquire(const struct storage *storage, enum storage_area area,

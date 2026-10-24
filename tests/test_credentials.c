@@ -531,6 +531,7 @@ static void test_vault_integration(void)
     char filename[TEST_VAULT_FILENAME_BYTES];
     char *home = make_temporary_home(home_template);
     struct storage storage = STORAGE_INITIALIZER;
+    struct storage_lock vault_lock = STORAGE_LOCK_INITIALIZER;
     struct account_session session = ACCOUNT_SESSION_INITIALIZER;
     struct credential_collection *collection = new_collection();
     struct credential_collection *decoded = new_collection();
@@ -538,9 +539,11 @@ static void test_vault_integration(void)
     unsigned char *serialized = NULL;
     unsigned char *decrypted = NULL;
     unsigned char *encrypted_file = NULL;
+    unsigned char *after_recovery = NULL;
     size_t serialized_length = 0;
     size_t decrypted_length = 0;
     size_t encrypted_length = 0;
+    size_t after_recovery_length = 0;
     int home_set;
 
     CHECK(home != NULL && collection != NULL && decoded != NULL);
@@ -577,6 +580,7 @@ static void test_vault_integration(void)
                      notes, sizeof(notes) - 1, record_id) == 1);
     CHECK(credentials_serialize(collection, &serialized,
                                 &serialized_length) == 1);
+    CHECK(vault_lock_acquire(&storage, &session, &vault_lock) == 1);
     CHECK(vault_write(&storage, &session,
                       serialized, serialized_length) == 1);
     vault_filename(session.user_id, filename);
@@ -587,18 +591,22 @@ static void test_vault_integration(void)
                           password, sizeof(password) - 1));
     CHECK(!contains_bytes(encrypted_file, encrypted_length,
                           username, sizeof(username) - 1));
-    storage_free(encrypted_file);
-    encrypted_file = NULL;
     credentials_serialized_free(serialized, serialized_length);
     serialized = NULL;
     serialized_length = 0;
     account_session_lock(&session);
+    storage_lock_release(&vault_lock);
     storage_close(&storage);
 
     CHECK(storage_init(&storage) == 1);
+    CHECK(account_register(&storage, "Integration", 11,
+                           master_password,
+                           sizeof(master_password) - 1) ==
+          ACCOUNT_REGISTER_RECOVERY);
     CHECK(account_unlock(&storage, "Integration", 11,
                          master_password, sizeof(master_password) - 1,
                          &session) == 1);
+    CHECK(vault_lock_acquire(&storage, &session, &vault_lock) == 1);
     CHECK(vault_read(&storage, &session, &decrypted,
                      &decrypted_length) == VAULT_READ_OK);
     CHECK(credentials_deserialize(decrypted, decrypted_length, decoded) == 1);
@@ -613,13 +621,23 @@ static void test_vault_integration(void)
         CHECK(record->notes_length == sizeof(notes) - 1);
         CHECK(memcmp(record->notes, notes, record->notes_length) == 0);
     }
+    CHECK(account_registration_complete(&storage, &session) == 1);
+    CHECK(storage_read_file(&storage, STORAGE_AREA_VAULTS, filename,
+                            STORAGE_MAX_FILE_BYTES, &after_recovery,
+                            &after_recovery_length) == STORAGE_READ_OK);
+    CHECK(after_recovery_length == encrypted_length);
+    if (after_recovery != NULL && after_recovery_length == encrypted_length) {
+        CHECK(memcmp(after_recovery, encrypted_file, encrypted_length) == 0);
+    }
 
     vault_secure_free(decrypted, decrypted_length);
     credentials_serialized_free(serialized, serialized_length);
     storage_free(encrypted_file);
+    storage_free(after_recovery);
     credentials_cleanup(collection);
     credentials_cleanup(decoded);
     account_session_lock(&session);
+    storage_lock_release(&vault_lock);
     storage_close(&storage);
     OPENSSL_cleanse(master_password, sizeof(master_password));
     free(collection);

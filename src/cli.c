@@ -75,11 +75,16 @@ static int register_user(const struct storage *storage)
     char password[CRYPTO_PASSWORD_MAX_BYTES + 1];
     char confirmation[CRYPTO_PASSWORD_MAX_BYTES + 1];
     struct account_session session = ACCOUNT_SESSION_INITIALIZER;
+    struct storage_lock vault_lock = STORAGE_LOCK_INITIALIZER;
     struct credential_collection *empty = NULL;
+    unsigned char *existing_payload = NULL;
     size_t username_length = 0;
     size_t password_length = 0;
     size_t confirmation_length = 0;
+    size_t existing_payload_length = 0;
     int read_result;
+    int registration_result;
+    int vault_result;
     int action = ACTION_CONTINUE;
 
     memset(password, 0, sizeof(password));
@@ -109,8 +114,9 @@ static int register_user(const struct storage *storage)
     }
     OPENSSL_cleanse(confirmation, sizeof(confirmation));
     confirmation_length = 0;
-    if (!account_register(storage, username, username_length,
-                          password, password_length)) {
+    registration_result = account_register(storage, username, username_length,
+                                           password, password_length);
+    if (registration_result == ACCOUNT_REGISTER_ERROR) {
         puts("Registration failed.");
         goto cleanup;
     }
@@ -121,7 +127,20 @@ static int register_user(const struct storage *storage)
     if (empty == NULL ||
         !account_unlock(storage, username, username_length,
                         password, password_length, &session) ||
-        !serialize_and_write(storage, &session, empty)) {
+        !vault_lock_acquire(storage, &session, &vault_lock)) {
+        puts("Account metadata was created, but encrypted vault "
+             "initialization failed. Registration is incomplete.");
+        goto cleanup;
+    }
+    vault_result = vault_read(storage, &session,
+                              &existing_payload, &existing_payload_length);
+    if ((vault_result == VAULT_READ_MISSING &&
+         !serialize_and_write(storage, &session, empty)) ||
+        (vault_result == VAULT_READ_OK &&
+         !credentials_deserialize(existing_payload,
+                                  existing_payload_length, empty)) ||
+        vault_result == VAULT_READ_ERROR ||
+        !account_registration_complete(storage, &session)) {
         puts("Account metadata was created, but encrypted vault "
              "initialization failed. Registration is incomplete.");
         goto cleanup;
@@ -132,11 +151,13 @@ cleanup:
     OPENSSL_cleanse(password, sizeof(password));
     OPENSSL_cleanse(confirmation, sizeof(confirmation));
     OPENSSL_cleanse(username, sizeof(username));
+    vault_secure_free(existing_payload, existing_payload_length);
     if (empty != NULL) {
         credentials_cleanup(empty);
         free(empty);
     }
     account_session_lock(&session);
+    storage_lock_release(&vault_lock);
     return action;
 }
 

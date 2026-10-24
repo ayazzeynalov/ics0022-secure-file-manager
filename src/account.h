@@ -8,6 +8,9 @@
 #include <stddef.h>
 
 #define ACCOUNT_MASTER_PASSWORD_MIN_BYTES 12
+#define ACCOUNT_REGISTER_ERROR 0
+#define ACCOUNT_REGISTER_CREATED 1
+#define ACCOUNT_REGISTER_RECOVERY 2
 
 struct account_session {
     int unlocked;
@@ -17,12 +20,17 @@ struct account_session {
 
 #define ACCOUNT_SESSION_INITIALIZER {0, {0}, {0}}
 
-/* Both operations return 1 on success and 0 for invalid input, authentication
- * failure, malformed metadata, or storage errors. New passwords must contain
- * at least 12 bytes. The caller owns and clears supplied password buffers. */
+/* Registration returns CREATED for new metadata or RECOVERY when a matching
+ * interrupted registration can resume. New passwords must contain at least
+ * 12 bytes. The caller owns and clears supplied password buffers. */
 int account_register(const struct storage *storage,
                      const char *username, size_t username_length,
                      const char *master_password, size_t password_length);
+
+/* Removes the pending marker only after the caller has ensured that a valid
+ * encrypted vault exists for the unlocked session. */
+int account_registration_complete(const struct storage *storage,
+                                  const struct account_session *session);
 
 /* Unlock retains the 1..CRYPTO_PASSWORD_MAX_BYTES range for existing accounts.
  * The session is locked before every attempt, and the VMK is published only
