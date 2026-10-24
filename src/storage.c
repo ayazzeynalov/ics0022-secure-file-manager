@@ -35,6 +35,27 @@ static int sync_directory(int directory_fd)
     return 0;
 }
 
+#ifdef SECUREPM_TEST_FAULTS
+static unsigned int atomic_sync_failure_countdown;
+
+void storage_test_fail_atomic_sync_after(unsigned int writes)
+{
+    atomic_sync_failure_countdown = writes;
+}
+#endif
+
+static int sync_atomic_directory(int directory_fd)
+{
+#ifdef SECUREPM_TEST_FAULTS
+    if (atomic_sync_failure_countdown != 0 &&
+        --atomic_sync_failure_countdown == 0) {
+        errno = EIO;
+        return 0;
+    }
+#endif
+    return sync_directory(directory_fd);
+}
+
 static int sync_file(int file_fd)
 {
 #ifdef __APPLE__
@@ -471,7 +492,7 @@ int storage_atomic_write(const struct storage *storage, enum storage_area area,
         goto cleanup;
     }
     temporary_exists = 0;
-    if (!sync_directory(directory_fd)) {
+    if (!sync_atomic_directory(directory_fd)) {
         goto cleanup;
     }
     success = 1;
@@ -569,9 +590,7 @@ int storage_lock_acquire(const struct storage *storage, enum storage_area area,
     }
     operation.l_type = F_WRLCK;
     operation.l_whence = SEEK_SET;
-    do {
-        result = fcntl(file_fd, F_SETLKW, &operation);
-    } while (result != 0 && errno == EINTR);
+    result = fcntl(file_fd, F_SETLKW, &operation);
     if (result != 0) {
         int saved_errno = errno;
 

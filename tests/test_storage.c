@@ -25,6 +25,7 @@
 
 static unsigned int checks;
 static unsigned int failures;
+static volatile sig_atomic_t lock_signal;
 
 #define CHECK(condition) do { \
     ++checks; \
@@ -33,6 +34,24 @@ static unsigned int failures;
         ++failures; \
     } \
 } while (0)
+
+static void record_lock_signal(int signal_number)
+{
+    lock_signal = signal_number;
+}
+
+static int count_open_descriptors(void)
+{
+    int count = 0;
+
+    for (int descriptor = 0; descriptor < 256; ++descriptor) {
+        errno = 0;
+        if (fcntl(descriptor, F_GETFD) != -1 || errno != EBADF) {
+            ++count;
+        }
+    }
+    return count;
+}
 
 static int make_path(char output[TEST_PATH_BYTES],
                      const char *first, const char *second)
@@ -541,6 +560,87 @@ static void test_lock_cleanup_after_exit(const struct storage *storage)
     CHECK(!storage_lock_is_held(&lock));
 }
 
+static void test_interrupted_lock_wait(const struct storage *storage)
+{
+    struct storage_lock parent_lock = STORAGE_LOCK_INITIALIZER;
+    int ready_pipe[2] = {-1, -1};
+    int result_pipe[2] = {-1, -1};
+    struct pollfd result_poll;
+    char byte = 0;
+    int status = 0;
+    pid_t child = -1;
+
+    CHECK(storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                               "interrupt.lock", &parent_lock) == 1);
+    CHECK(pipe(ready_pipe) == 0);
+    CHECK(pipe(result_pipe) == 0);
+    if (!storage_lock_is_held(&parent_lock) || ready_pipe[0] < 0 ||
+        result_pipe[0] < 0) {
+        storage_lock_release(&parent_lock);
+        return;
+    }
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        struct storage_lock child_lock = STORAGE_LOCK_INITIALIZER;
+        struct sigaction action = {0};
+        int descriptors_before;
+        int saved_errno;
+        int success;
+
+        close(ready_pipe[0]);
+        close(result_pipe[0]);
+        lock_signal = 0;
+        action.sa_handler = record_lock_signal;
+        if (sigemptyset(&action.sa_mask) != 0 ||
+            sigaction(SIGTERM, &action, NULL) != 0) {
+            _exit(1);
+        }
+        descriptors_before = count_open_descriptors();
+        if (write(ready_pipe[1], "R", 1) != 1) {
+            _exit(1);
+        }
+        errno = 0;
+        success = !storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                                        "interrupt.lock", &child_lock);
+        saved_errno = errno;
+        success = success && saved_errno == EINTR &&
+                  lock_signal == SIGTERM &&
+                  !storage_lock_is_held(&child_lock) &&
+                  count_open_descriptors() == descriptors_before;
+        storage_lock_release(&child_lock);
+        byte = success ? 'P' : 'F';
+        if (write(result_pipe[1], &byte, 1) != 1) {
+            _exit(1);
+        }
+        _exit(success ? 0 : 1);
+    }
+    close(ready_pipe[1]);
+    close(result_pipe[1]);
+    ready_pipe[1] = -1;
+    result_pipe[1] = -1;
+    if (child > 0) {
+        CHECK(read(ready_pipe[0], &byte, 1) == 1 && byte == 'R');
+        result_poll.fd = result_pipe[0];
+        result_poll.events = POLLIN;
+        result_poll.revents = 0;
+        CHECK(poll(&result_poll, 1, 200) == 0);
+        CHECK(kill(child, SIGTERM) == 0);
+        result_poll.revents = 0;
+        if (poll(&result_poll, 1, 5000) == 1) {
+            CHECK(read(result_pipe[0], &byte, 1) == 1 && byte == 'P');
+        } else {
+            CHECK(0);
+            (void)kill(child, SIGKILL);
+        }
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    storage_lock_release(&parent_lock);
+    close(ready_pipe[0]);
+    close(result_pipe[0]);
+}
+
 int main(void)
 {
     char home_template[TEST_PATH_BYTES];
@@ -570,6 +670,7 @@ int main(void)
         test_locking(&storage, home);
         test_unsafe_lock_files(&storage, home);
         test_lock_cleanup_after_exit(&storage);
+        test_interrupted_lock_wait(&storage);
     }
     storage_close(&storage);
     CHECK(remove_tree(home));

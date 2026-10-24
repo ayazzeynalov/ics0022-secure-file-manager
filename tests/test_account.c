@@ -19,6 +19,8 @@
 
 #define TEST_PATH_BYTES 4096
 
+void storage_test_fail_atomic_sync_after(unsigned int writes);
+
 static unsigned int checks;
 static unsigned int failures;
 
@@ -477,6 +479,45 @@ static void test_session_lock(struct account_session *session)
     check_locked(session);
 }
 
+static void test_ambiguous_registration_commit(const char *original_home)
+{
+    char password[] = "dummy-ambiguous-commit-password";
+    char home_template[TEST_PATH_BYTES];
+    char *home = make_temporary_home(home_template);
+    struct storage storage = STORAGE_INITIALIZER;
+    struct user_database database;
+    struct account_session session = ACCOUNT_SESSION_INITIALIZER;
+    int home_set;
+
+    CHECK(home != NULL);
+    if (home == NULL) {
+        return;
+    }
+    home_set = setenv("HOME", home, 1) == 0;
+    CHECK(home_set);
+    if (home_set) {
+        CHECK(storage_init(&storage) == 1);
+        storage_test_fail_atomic_sync_after(2);
+        CHECK(account_register(&storage, "Ambiguous", 9,
+                               password, sizeof(password) - 1) ==
+              ACCOUNT_REGISTER_ERROR);
+        user_db_init(&database);
+        CHECK(user_db_load(&storage, &database) == 1);
+        CHECK(user_db_find_username(&database, "Ambiguous", 9) != NULL);
+        CHECK(account_register(&storage, "Ambiguous", 9,
+                               password, sizeof(password) - 1) ==
+              ACCOUNT_REGISTER_RECOVERY);
+        CHECK(account_unlock(&storage, "Ambiguous", 9,
+                             password, sizeof(password) - 1,
+                             &session) == 1);
+    }
+    account_session_lock(&session);
+    storage_close(&storage);
+    CHECK(remove_tree(home));
+    CHECK(setenv("HOME", original_home, 1) == 0);
+    OPENSSL_cleanse(password, sizeof(password));
+}
+
 int main(void)
 {
     char home_template[TEST_PATH_BYTES];
@@ -529,6 +570,7 @@ int main(void)
     }
     account_session_lock(&session);
     storage_close(&storage);
+    test_ambiguous_registration_commit(home);
     OPENSSL_cleanse(&alice_record, sizeof(alice_record));
     OPENSSL_cleanse(alice_password, sizeof(alice_password));
     OPENSSL_cleanse(carol_password, sizeof(carol_password));

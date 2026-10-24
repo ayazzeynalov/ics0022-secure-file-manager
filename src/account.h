@@ -28,7 +28,7 @@ int account_register(const struct storage *storage,
                      const char *master_password, size_t password_length);
 
 /* Removes the pending marker only after the caller has ensured that a valid
- * encrypted vault exists for the unlocked session. */
+ * encrypted vault exists. Repeating completion for the same session succeeds. */
 int account_registration_complete(const struct storage *storage,
                                   const struct account_session *session);
 

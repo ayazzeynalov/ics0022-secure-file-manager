@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <openssl/crypto.h>
 
@@ -520,6 +521,198 @@ static void vault_filename(const unsigned char user_id[USER_DB_USER_ID_BYTES],
     memcpy(filename + position, ".vault", sizeof(".vault"));
 }
 
+static int transfer_byte(int descriptor, char *byte, int writing)
+{
+    ssize_t result;
+
+    do {
+        result = writing ? write(descriptor, byte, 1) :
+                           read(descriptor, byte, 1);
+    } while (result < 0 && errno == EINTR);
+    return result == 1;
+}
+
+static int recover_pending_account(int ready_fd, int start_fd, int done_fd)
+{
+    static const char password[] = "dummy-concurrent-recovery-password";
+    struct storage storage = STORAGE_INITIALIZER;
+    struct storage_lock vault_lock = STORAGE_LOCK_INITIALIZER;
+    struct account_session session = ACCOUNT_SESSION_INITIALIZER;
+    struct credential_collection *collection = new_collection();
+    unsigned char *payload = NULL;
+    unsigned char *serialized = NULL;
+    size_t payload_length = 0;
+    size_t serialized_length = 0;
+    char byte = 'R';
+    int vault_result;
+    int success = collection != NULL && storage_init(&storage) == 1 &&
+                  account_register(&storage, "Concurrent", 10,
+                                   password, sizeof(password) - 1) ==
+                      ACCOUNT_REGISTER_RECOVERY;
+
+    byte = success ? 'R' : 'F';
+    success = transfer_byte(ready_fd, &byte, 1) && success;
+    if (transfer_byte(start_fd, &byte, 0) && success) {
+        success = account_unlock(&storage, "Concurrent", 10,
+                                 password, sizeof(password) - 1,
+                                 &session) == 1 &&
+                  vault_lock_acquire(&storage, &session, &vault_lock) == 1;
+    } else {
+        success = 0;
+    }
+
+    if (success) {
+        vault_result = vault_read(&storage, &session,
+                                  &payload, &payload_length);
+        if (vault_result == VAULT_READ_MISSING) {
+            success = credentials_serialize(collection, &serialized,
+                                            &serialized_length) == 1 &&
+                      vault_write(&storage, &session,
+                                  serialized, serialized_length) == 1;
+        } else if (vault_result == VAULT_READ_OK) {
+            success = credentials_deserialize(payload, payload_length,
+                                              collection) == 1 &&
+                      collection->count == 0;
+        } else {
+            success = 0;
+        }
+    }
+    if (success) {
+        success = account_registration_complete(&storage, &session) == 1;
+    }
+    byte = success ? 'D' : 'F';
+    (void)transfer_byte(done_fd, &byte, 1);
+    vault_secure_free(payload, payload_length);
+    credentials_serialized_free(serialized, serialized_length);
+    if (collection != NULL) {
+        credentials_cleanup(collection);
+        free(collection);
+    }
+    account_session_lock(&session);
+    storage_lock_release(&vault_lock);
+    storage_close(&storage);
+    return success;
+}
+
+static void test_concurrent_registration_recovery(void)
+{
+    static const char password[] = "dummy-concurrent-recovery-password";
+    char home_template[TEST_PATH_BYTES];
+    char filename[TEST_VAULT_FILENAME_BYTES];
+    char *home = make_temporary_home(home_template);
+    struct storage storage = STORAGE_INITIALIZER;
+    struct user_database database;
+    const struct user_record *record;
+    unsigned char *first_vault = NULL;
+    unsigned char *second_vault = NULL;
+    size_t first_length = 0;
+    size_t second_length = 0;
+    int ready_pipe[2] = {-1, -1};
+    int done_pipe[2] = {-1, -1};
+    int start_pipes[2][2] = {{-1, -1}, {-1, -1}};
+    pid_t children[2] = {-1, -1};
+    int statuses[2] = {0, 0};
+    char byte;
+    int home_set;
+
+    CHECK(home != NULL);
+    if (home == NULL) {
+        return;
+    }
+    home_set = setenv("HOME", home, 1) == 0;
+    CHECK(home_set);
+    CHECK(home_set && storage_init(&storage) == 1);
+    CHECK(account_register(&storage, "Concurrent", 10,
+                           password, sizeof(password) - 1) ==
+          ACCOUNT_REGISTER_CREATED);
+    user_db_init(&database);
+    CHECK(user_db_load(&storage, &database) == 1);
+    record = user_db_find_username(&database, "Concurrent", 10);
+    CHECK(record != NULL);
+    if (record != NULL) {
+        vault_filename(record->user_id, filename);
+    }
+    storage_close(&storage);
+
+    CHECK(pipe(ready_pipe) == 0);
+    CHECK(pipe(done_pipe) == 0);
+    CHECK(pipe(start_pipes[0]) == 0);
+    CHECK(pipe(start_pipes[1]) == 0);
+    if (record != NULL && ready_pipe[0] >= 0 && done_pipe[0] >= 0 &&
+        start_pipes[0][0] >= 0 && start_pipes[1][0] >= 0) {
+        for (size_t index = 0; index < 2; ++index) {
+            children[index] = fork();
+            CHECK(children[index] >= 0);
+            if (children[index] == 0) {
+                close(ready_pipe[0]);
+                close(done_pipe[0]);
+                close(start_pipes[index][1]);
+                close(start_pipes[1 - index][0]);
+                close(start_pipes[1 - index][1]);
+                _exit(recover_pending_account(ready_pipe[1],
+                                              start_pipes[index][0],
+                                              done_pipe[1]) ? 0 : 1);
+            }
+        }
+        close(ready_pipe[1]);
+        close(done_pipe[1]);
+        close(start_pipes[0][0]);
+        close(start_pipes[1][0]);
+        ready_pipe[1] = -1;
+        done_pipe[1] = -1;
+        start_pipes[0][0] = -1;
+        start_pipes[1][0] = -1;
+        CHECK(transfer_byte(ready_pipe[0], &byte, 0) && byte == 'R');
+        CHECK(transfer_byte(ready_pipe[0], &byte, 0) && byte == 'R');
+
+        byte = 'S';
+        CHECK(transfer_byte(start_pipes[0][1], &byte, 1));
+        CHECK(transfer_byte(done_pipe[0], &byte, 0) && byte == 'D');
+        CHECK(storage_init(&storage) == 1);
+        CHECK(storage_read_file(&storage, STORAGE_AREA_VAULTS, filename,
+                                STORAGE_MAX_FILE_BYTES, &first_vault,
+                                &first_length) == STORAGE_READ_OK);
+        storage_close(&storage);
+
+        byte = 'S';
+        CHECK(transfer_byte(start_pipes[1][1], &byte, 1));
+        CHECK(transfer_byte(done_pipe[0], &byte, 0) && byte == 'D');
+        CHECK(storage_init(&storage) == 1);
+        CHECK(storage_read_file(&storage, STORAGE_AREA_VAULTS, filename,
+                                STORAGE_MAX_FILE_BYTES, &second_vault,
+                                &second_length) == STORAGE_READ_OK);
+        storage_close(&storage);
+        CHECK(first_length == second_length);
+        if (first_vault != NULL && second_vault != NULL &&
+            first_length == second_length) {
+            CHECK(memcmp(first_vault, second_vault, first_length) == 0);
+        }
+        for (size_t index = 0; index < 2; ++index) {
+            CHECK(waitpid(children[index], &statuses[index], 0) ==
+                  children[index]);
+            CHECK(WIFEXITED(statuses[index]) &&
+                  WEXITSTATUS(statuses[index]) == 0);
+        }
+    }
+    storage_free(first_vault);
+    storage_free(second_vault);
+    storage_close(&storage);
+    for (size_t index = 0; index < 2; ++index) {
+        if (ready_pipe[index] >= 0) {
+            close(ready_pipe[index]);
+        }
+        if (done_pipe[index] >= 0) {
+            close(done_pipe[index]);
+        }
+        for (size_t pipe_index = 0; pipe_index < 2; ++pipe_index) {
+            if (start_pipes[index][pipe_index] >= 0) {
+                close(start_pipes[index][pipe_index]);
+            }
+        }
+    }
+    CHECK(remove_tree(home));
+}
+
 static void test_vault_integration(void)
 {
     static const unsigned char label[] = "integration service";
@@ -654,6 +847,7 @@ int main(void)
     test_malformed_payloads();
     test_secure_cleanup();
     test_vault_integration();
+    test_concurrent_registration_recovery();
 
     if (failures != 0) {
         fprintf(stderr, "FAIL: %u of %u credential checks\n",

@@ -55,7 +55,8 @@ int storage_atomic_write(const struct storage *storage, enum storage_area area,
 int storage_remove_file(const struct storage *storage, enum storage_area area,
                         const char *filename);
 
-/* Lock files are stable objects and are never replaced by atomic writes. */
+/* Lock files are stable objects and are never replaced by atomic writes.
+ * An interrupted blocking wait fails with errno set to EINTR. */
 int storage_lock_acquire(const struct storage *storage, enum storage_area area,
                          const char *filename, struct storage_lock *lock);
 int storage_lock_is_held(const struct storage_lock *lock);

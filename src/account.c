@@ -10,6 +10,9 @@
 #define ACCOUNT_DATABASE_LOCK "users.lock"
 #define ACCOUNT_PENDING_FILENAME_BYTES \
     (USER_DB_USER_ID_BYTES * 2 + sizeof(".pending"))
+#define ACCOUNT_PENDING_ERROR (-1)
+#define ACCOUNT_PENDING_MISSING 0
+#define ACCOUNT_PENDING_PRESENT 1
 
 static const unsigned char pending_magic[] = {
     'S', 'P', 'M', 'P', 'E', 'N', 'D', '1'
@@ -33,7 +36,7 @@ static int pending_filename(
     return 1;
 }
 
-static int pending_registration_exists(
+static int pending_registration_status(
     const struct storage *storage,
     const unsigned char user_id[USER_DB_USER_ID_BYTES])
 {
@@ -44,16 +47,40 @@ static int pending_registration_exists(
     int valid;
 
     if (!pending_filename(user_id, filename)) {
-        return 0;
+        return ACCOUNT_PENDING_ERROR;
     }
     read_result = storage_read_file(storage, STORAGE_AREA_ROOT, filename,
                                     sizeof(pending_magic),
                                     &stored, &stored_length);
+    if (read_result == STORAGE_READ_MISSING) {
+        storage_free(stored);
+        return ACCOUNT_PENDING_MISSING;
+    }
     valid = read_result == STORAGE_READ_OK &&
             stored_length == sizeof(pending_magic) &&
             CRYPTO_memcmp(stored, pending_magic, sizeof(pending_magic)) == 0;
     storage_free(stored);
-    return valid;
+    return valid ? ACCOUNT_PENDING_PRESENT : ACCOUNT_PENDING_ERROR;
+}
+
+static int registration_record_status(
+    const struct storage *storage, const struct user_record *record)
+{
+    struct user_database stored;
+    const struct user_record *found;
+    size_t username_length;
+
+    user_db_init(&stored);
+    username_length = strlen(record->username);
+    if (!user_db_load(storage, &stored)) {
+        return -1;
+    }
+    found = user_db_find_username(&stored, record->username, username_length);
+    if (found == NULL) {
+        return 0;
+    }
+    return memcmp(found->user_id, record->user_id,
+                  sizeof(record->user_id)) == 0 ? 1 : -1;
 }
 
 static int authenticate_record(const struct user_record *record,
@@ -144,6 +171,7 @@ int account_register(const struct storage *storage,
     struct storage_lock database_lock = STORAGE_LOCK_INITIALIZER;
     char pending[ACCOUNT_PENDING_FILENAME_BYTES];
     const struct user_record *existing;
+    int save_attempted = 0;
     int marker_written = 0;
     int success = 0;
 
@@ -163,7 +191,8 @@ int account_register(const struct storage *storage,
     }
     existing = user_db_find_username(&database, username, username_length);
     if (existing != NULL) {
-        if (pending_registration_exists(storage, existing->user_id) &&
+        if (pending_registration_status(storage, existing->user_id) ==
+                ACCOUNT_PENDING_PRESENT &&
             authenticate_record(existing, master_password, password_length)) {
             success = ACCOUNT_REGISTER_RECOVERY;
         }
@@ -213,14 +242,18 @@ int account_register(const struct storage *storage,
         goto cleanup;
     }
     marker_written = 1;
-    if (!user_db_add(&database, &record) ||
-        !user_db_save(storage, &database)) {
+    if (!user_db_add(&database, &record)) {
+        goto cleanup;
+    }
+    save_attempted = 1;
+    if (!user_db_save(storage, &database)) {
         goto cleanup;
     }
     success = ACCOUNT_REGISTER_CREATED;
 
 cleanup:
-    if (marker_written && success != ACCOUNT_REGISTER_CREATED) {
+    if (marker_written && success != ACCOUNT_REGISTER_CREATED &&
+        (!save_attempted || registration_record_status(storage, &record) == 0)) {
         (void)storage_remove_file(storage, STORAGE_AREA_ROOT, pending);
     }
     storage_lock_release(&database_lock);
@@ -236,6 +269,7 @@ int account_registration_complete(const struct storage *storage,
     struct storage_lock database_lock = STORAGE_LOCK_INITIALIZER;
     struct user_database database;
     char filename[ACCOUNT_PENDING_FILENAME_BYTES];
+    int pending_status;
     int success = 0;
 
     user_db_init(&database);
@@ -245,9 +279,13 @@ int account_registration_complete(const struct storage *storage,
                               ACCOUNT_DATABASE_LOCK, &database_lock) ||
         !user_db_load(storage, &database) ||
         user_db_find_user_id(&database, session->user_id,
-                             sizeof(session->user_id)) == NULL ||
-        !pending_registration_exists(storage, session->user_id) ||
-        !storage_remove_file(storage, STORAGE_AREA_ROOT, filename)) {
+                             sizeof(session->user_id)) == NULL) {
+        goto cleanup;
+    }
+    pending_status = pending_registration_status(storage, session->user_id);
+    if (pending_status == ACCOUNT_PENDING_ERROR ||
+        (pending_status == ACCOUNT_PENDING_PRESENT &&
+         !storage_remove_file(storage, STORAGE_AREA_ROOT, filename))) {
         goto cleanup;
     }
     success = 1;
