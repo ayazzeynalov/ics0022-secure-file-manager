@@ -1,3 +1,9 @@
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#else
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "cli.h"
 
 #include "account.h"
@@ -6,17 +12,59 @@
 #include "storage.h"
 #include "vault.h"
 
+#include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <openssl/crypto.h>
 
 #define MENU_INPUT_BYTES 16
+#define LOGIN_DELAY_BASE_MILLISECONDS 500U
+#define LOGIN_DELAY_MAX_FAILURES 3U
 
 #define ACTION_CONTINUE 0
 #define ACTION_EXIT 1
 #define ACTION_INPUT_END 2
+
+struct login_throttle {
+    unsigned int failures;
+};
+
+static void throttle_login_failure(struct login_throttle *throttle,
+                                   const struct timespec *attempt_start)
+{
+    struct timespec now;
+    struct timespec delay;
+    int64_t remaining_nanoseconds;
+    unsigned int delay_milliseconds;
+
+    if (throttle == NULL) {
+        return;
+    }
+    if (throttle->failures < LOGIN_DELAY_MAX_FAILURES) {
+        ++throttle->failures;
+    }
+    delay_milliseconds = LOGIN_DELAY_BASE_MILLISECONDS <<
+                         (throttle->failures - 1);
+    remaining_nanoseconds = (int64_t)delay_milliseconds * 1000000;
+    if (attempt_start != NULL &&
+        clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+        remaining_nanoseconds -=
+            (int64_t)(now.tv_sec - attempt_start->tv_sec) * 1000000000 +
+            (int64_t)now.tv_nsec - attempt_start->tv_nsec;
+    }
+    if (remaining_nanoseconds <= 0) {
+        return;
+    }
+    delay.tv_sec = (time_t)(remaining_nanoseconds / 1000000000);
+    delay.tv_nsec = (long)(remaining_nanoseconds % 1000000000);
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR &&
+           input_interrupted_signal() == 0) {
+    }
+}
 
 static void print_help(const char *program)
 {
@@ -345,7 +393,8 @@ static int authenticated_menu(
     return ACTION_CONTINUE;
 }
 
-static int login_user(const struct storage *storage)
+static int login_user(const struct storage *storage,
+                      struct login_throttle *throttle)
 {
     char username[USER_DB_USERNAME_MAX_BYTES + 1];
     char password[CRYPTO_PASSWORD_MAX_BYTES + 1];
@@ -358,6 +407,8 @@ static int login_user(const struct storage *storage)
     size_t payload_length = 0;
     int read_result;
     int action = ACTION_CONTINUE;
+    struct timespec attempt_start;
+    int have_attempt_start = 0;
 
     memset(password, 0, sizeof(password));
     read_result = read_value("Username: ", username, sizeof(username),
@@ -372,10 +423,16 @@ static int login_user(const struct storage *storage)
         action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
         goto cleanup;
     }
+    have_attempt_start = clock_gettime(CLOCK_MONOTONIC, &attempt_start) == 0;
     if (!account_unlock(storage, username, username_length,
                         password, password_length, &session)) {
+        throttle_login_failure(throttle,
+                               have_attempt_start ? &attempt_start : NULL);
         puts("Login failed.");
         goto cleanup;
+    }
+    if (throttle != NULL) {
+        throttle->failures = 0;
     }
     OPENSSL_cleanse(password, sizeof(password));
     password_length = 0;
@@ -417,6 +474,7 @@ cleanup:
 static int interactive_run(void)
 {
     struct storage storage = STORAGE_INITIALIZER;
+    struct login_throttle throttle = {0};
     char choice[MENU_INPUT_BYTES];
     size_t choice_length;
     int exit_status = 0;
@@ -452,7 +510,7 @@ static int interactive_run(void)
         if (choice_length == 1 && choice[0] == '1') {
             action = register_user(&storage);
         } else if (choice_length == 1 && choice[0] == '2') {
-            action = login_user(&storage);
+            action = login_user(&storage, &throttle);
         } else if (choice_length == 1 && choice[0] == '3') {
             break;
         } else {

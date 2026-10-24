@@ -156,6 +156,13 @@ static int deadline_expired(const struct timespec *start)
     return now.tv_sec - start->tv_sec >= DIALOG_TIMEOUT_SECONDS;
 }
 
+static int64_t elapsed_milliseconds(const struct timespec *start,
+                                    const struct timespec *end)
+{
+    return (int64_t)(end->tv_sec - start->tv_sec) * 1000 +
+           (end->tv_nsec - start->tv_nsec) / 1000000;
+}
+
 static int wait_for_text(int master, struct transcript *transcript,
                          const char *expected)
 {
@@ -605,7 +612,15 @@ int main(int argc, char *argv[])
         {"Username: ", "Alice\n"},
         {"Master password: ", "dummy-wrong-password\n"},
         {"Login failed.", NULL},
-        {"Choice: ", "3\n"}
+        {"Choice: ", "2\n"},
+        {"Username: ", "Missing\n"},
+        {"Master password: ", "dummy-wrong-password\n"},
+        {"Login failed.", NULL},
+        {"Choice: ", "2\n"},
+        {"Username: ", "Alice\n"},
+        {"Master password: ", "dummy-master-password-42\n"},
+        {"Login successful.", NULL},
+        {"Choice: ", "4\n"}
     };
     static const struct dialog_step add_steps[] = {
         {"Choice: ", "2\n"},
@@ -649,6 +664,8 @@ int main(int argc, char *argv[])
     unsigned char *after_failure = NULL;
     size_t vault_length = 0;
     size_t after_failure_length = 0;
+    struct timespec throttle_start = {0};
+    struct timespec throttle_end = {0};
     const char *program;
 
     if (argc != 2) {
@@ -687,10 +704,13 @@ int main(int argc, char *argv[])
     CHECK(S_ISREG(vault_status.st_mode));
     CHECK((vault_status.st_mode & 07777) == 0600);
 
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &throttle_start) == 0);
     CHECK(run_dialog(program, home, wrong_password_steps,
                      sizeof(wrong_password_steps) /
                          sizeof(wrong_password_steps[0]),
                      &transcript));
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &throttle_end) == 0);
+    CHECK(elapsed_milliseconds(&throttle_start, &throttle_end) >= 1400);
     CHECK(!contains_bytes(transcript.data, transcript.length,
                           (const unsigned char *)wrong_password,
                           sizeof(wrong_password) - 1));

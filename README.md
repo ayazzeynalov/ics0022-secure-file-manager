@@ -91,6 +91,14 @@ command-line arguments or displayed by the list operation. Run
   settings are restored after normal input, EOF, errors, or handled signals.
   Password-derived keys, plaintext payloads, credential collections, and
   session VMKs are cleared with OpenSSL cleanup functions when released.
+- **Concurrent access:** stable `0600` lock files serialize user registration
+  and each vault's complete read-modify-write session. Data files continue to
+  use atomic replacement.
+- **Registration recovery:** a pending marker allows an interrupted account
+  creation to resume only after the same master password is authenticated.
+- **Login throttling:** failures in one interactive process take at least 0.5,
+  1, then 2 seconds, with later failures capped at 2 seconds. A successful
+  authentication resets the delay.
 
 Authentication failures use a generic CLI message. The program relies on
 OpenSSL primitives and does not implement cryptographic algorithms itself.
@@ -134,8 +142,8 @@ make OPENSSL_CFLAGS='-I/opt/openssl/include' \
      OPENSSL_LIBS='-L/opt/openssl/lib -lcrypto'
 ```
 
-The application builds and all 2,292 tests pass on macOS and Ubuntu 24.04.5
-ARM64. The Linux run used GCC 13.3.0 and OpenSSL 3.0.13.
+The application and full test suite pass on macOS and Ubuntu 24.04.5 ARM64.
+The Linux run used GCC 13.3.0 and OpenSSL 3.0.13.
 
 ## Tests
 
@@ -159,14 +167,12 @@ security audit or a benchmark of password-guessing resistance.
 ## Remaining limitations and planned work
 
 Checkpoint 2 does not yet provide credential retrieval, update, or deletion.
-It also has no structured audit logging, login retry throttling, password
-generation, or clipboard integration. These features are planned after the
-current checkpoint.
+It also has no structured audit logging, password generation, or clipboard
+integration. These features are planned after the current checkpoint.
 
-There is no process-level file locking, so concurrent read-modify-write
-operations can overwrite each other. If user metadata is saved but initial
-vault creation fails, the CLI reports incomplete registration, but it cannot
-roll back or recover that user record automatically.
+Login throttling applies only within one running process. It cannot prevent a
+new process from starting fresh or slow offline attacks against stolen
+authentication metadata.
 
 Sensitive buffers are cleared when released, but memory is not locked against
 swapping and cannot be protected from a privileged process. The encrypted
