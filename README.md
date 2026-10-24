@@ -1,8 +1,7 @@
 # ICS0022 Secure Password Manager
 
-This is the Checkpoint 2 implementation of a local password manager for the
-ICS0022 Secure Programming course. It is written in C17 and uses OpenSSL 3.x
-and POSIX APIs.
+This is a local password manager for the ICS0022 Secure Programming course. It
+is written in C17 and uses OpenSSL 3.x and POSIX APIs.
 
 ## Implemented features
 
@@ -14,6 +13,8 @@ The current command-line application supports:
 - adding credentials with a label, username, password, and optional notes;
 - listing credential record IDs, labels, and usernames without displaying
   passwords;
+- viewing a credential's non-secret details by record ID;
+- updating and deleting credentials by record ID;
 - locking the active session; and
 - loading the same encrypted vault after restarting the program.
 
@@ -58,13 +59,17 @@ After login, the menu provides:
 Vault menu:
 1. Add credential
 2. List credentials
-3. Lock
-4. Exit
+3. View credential details
+4. Update credential
+5. Delete credential
+6. Lock
+7. Exit
 ```
 
-Adding a credential rewrites the encrypted vault atomically. Listing displays
-only the record ID, label, and username. Passwords are never accepted as
-command-line arguments or displayed by the list operation. Run
+Adding, updating, or deleting a credential rewrites the encrypted vault
+atomically while the user's vault lock is held. Viewing displays the record ID,
+label, username, and notes. Listing and viewing do not display stored
+passwords. Passwords are never accepted as command-line arguments. Run
 `./securepm --help` for the command summary.
 
 ## Security decisions
@@ -156,8 +161,8 @@ The Linux run used GCC 13.3.0 and OpenSSL 3.0.13.
 - POSIX storage and file-permission tests;
 - user database, account, vault, and credential serialization tests; and
 - pseudo-terminal integration tests for registration, hidden input, login,
-  credential persistence, malformed vault handling, bounded input, and terminal
-  restoration.
+  credential retrieval, update and deletion, malformed vault handling, bounded
+  input, and terminal restoration.
 
 Filesystem tests use isolated temporary `HOME` directories and dummy secrets.
 The test suite covers authentication failures, malformed and truncated files,
@@ -166,9 +171,10 @@ security audit or a benchmark of password-guessing resistance.
 
 ## Remaining limitations and planned work
 
-Checkpoint 2 does not yet provide credential retrieval, update, or deletion.
-It also has no structured audit logging, password generation, or clipboard
-integration. These features are planned after the current checkpoint.
+Stored passwords are available to the authenticated process but are not shown
+by the CLI. There is no reviewed clipboard or other secret-output mechanism
+yet. The application also has no structured audit logging or password
+generation.
 
 Login throttling applies only within one running process. It cannot prevent a
 new process from starting fresh or slow offline attacks against stolen
