@@ -21,6 +21,7 @@
 #define STORAGE_TEMP_NAME_BYTES 96
 #define STORAGE_TEMP_ATTEMPTS 128
 #define STORAGE_TEMP_PREFIX ".securepm.tmp."
+#define STORAGE_APPEND_LOCK_SUFFIX ".lock"
 
 static int sync_directory(int directory_fd)
 {
@@ -37,10 +38,28 @@ static int sync_directory(int directory_fd)
 
 #ifdef SECUREPM_TEST_FAULTS
 static unsigned int atomic_sync_failure_countdown;
+static unsigned int append_failure_countdown;
+static int append_interrupt_once;
+static size_t append_write_limit_once;
 
 void storage_test_fail_atomic_sync_after(unsigned int writes)
 {
     atomic_sync_failure_countdown = writes;
+}
+
+void storage_test_fail_append_after(unsigned int writes)
+{
+    append_failure_countdown = writes;
+}
+
+void storage_test_interrupt_append_once(void)
+{
+    append_interrupt_once = 1;
+}
+
+void storage_test_limit_append_write_once(size_t maximum)
+{
+    append_write_limit_once = maximum;
 }
 #endif
 
@@ -448,6 +467,50 @@ static int write_all(int file_fd, const unsigned char *data, size_t data_length)
     return 1;
 }
 
+static ssize_t append_write(int file_fd, const unsigned char *data,
+                            size_t data_length)
+{
+#ifdef SECUREPM_TEST_FAULTS
+    if (append_interrupt_once) {
+        append_interrupt_once = 0;
+        errno = EINTR;
+        return -1;
+    }
+    if (append_failure_countdown != 0 &&
+        --append_failure_countdown == 0) {
+        errno = EIO;
+        return -1;
+    }
+    if (append_write_limit_once != 0 &&
+        data_length > append_write_limit_once) {
+        data_length = append_write_limit_once;
+        append_write_limit_once = 0;
+    }
+#endif
+    return write(file_fd, data, data_length);
+}
+
+static int append_all(int file_fd, const unsigned char *data,
+                      size_t data_length)
+{
+    size_t offset = 0;
+
+    while (offset < data_length) {
+        ssize_t count = append_write(file_fd, data + offset,
+                                     data_length - offset);
+
+        if (count > 0) {
+            offset += (size_t)count;
+        } else if (count == 0) {
+            errno = EIO;
+            return 0;
+        } else if (errno != EINTR) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int storage_atomic_write(const struct storage *storage, enum storage_area area,
                          const char *filename,
                          const unsigned char *data, size_t data_length)
@@ -506,6 +569,111 @@ cleanup:
         if (temporary_exists) {
             unlinkat(directory_fd, temporary_name, 0);
         }
+        errno = saved_errno;
+    }
+    return success;
+}
+
+static int open_append_file(int directory_fd, const char *filename,
+                            int *created)
+{
+    int file_fd;
+
+    *created = 0;
+    file_fd = openat(directory_fd, filename,
+                     O_WRONLY | O_APPEND | O_CREAT | O_EXCL | O_NONBLOCK |
+                         O_CLOEXEC | O_NOFOLLOW,
+                     STORAGE_FILE_MODE);
+    if (file_fd >= 0) {
+        *created = 1;
+        return file_fd;
+    }
+    if (errno != EEXIST) {
+        return -1;
+    }
+    return openat(directory_fd, filename,
+                  O_WRONLY | O_APPEND | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+}
+
+int storage_append_file(const struct storage *storage, enum storage_area area,
+                        const char *filename,
+                        const unsigned char *data, size_t data_length,
+                        size_t maximum_size)
+{
+    struct storage_lock lock = STORAGE_LOCK_INITIALIZER;
+    struct stat status;
+    char lock_name[STORAGE_FILENAME_MAX_BYTES + 1];
+    size_t filename_length;
+    size_t lock_suffix_length = sizeof(STORAGE_APPEND_LOCK_SUFFIX) - 1;
+    off_t original_size = 0;
+    int directory_fd;
+    int file_fd = -1;
+    int created = 0;
+    int may_have_written = 0;
+    int success = 0;
+
+    directory_fd = area_fd(storage, area);
+    if (directory_fd < 0 || !valid_filename(filename) ||
+        (data == NULL && data_length != 0) ||
+        maximum_size > STORAGE_MAX_FILE_BYTES || data_length > maximum_size) {
+        errno = EINVAL;
+        return 0;
+    }
+    filename_length = strlen(filename);
+    if (filename_length > STORAGE_FILENAME_MAX_BYTES - lock_suffix_length) {
+        errno = ENAMETOOLONG;
+        return 0;
+    }
+    memcpy(lock_name, filename, filename_length);
+    memcpy(lock_name + filename_length, STORAGE_APPEND_LOCK_SUFFIX,
+           lock_suffix_length + 1);
+    if (!storage_lock_acquire(storage, area, lock_name, &lock)) {
+        return 0;
+    }
+    file_fd = open_append_file(directory_fd, filename, &created);
+    if (file_fd < 0 ||
+        (created && fchmod(file_fd, STORAGE_FILE_MODE) != 0) ||
+        fstat(file_fd, &status) != 0 || !secure_file_stat(&status)) {
+        goto cleanup;
+    }
+    if (status.st_size < 0 || (uintmax_t)status.st_size > maximum_size ||
+        data_length > maximum_size - (size_t)status.st_size) {
+        errno = EFBIG;
+        goto cleanup;
+    }
+    original_size = status.st_size;
+    may_have_written = data_length != 0;
+    if (!append_all(file_fd, data, data_length) || !sync_file(file_fd)) {
+        goto cleanup;
+    }
+    may_have_written = 0;
+    if (created && !sync_directory(directory_fd)) {
+        goto cleanup;
+    }
+    if (close(file_fd) != 0) {
+        file_fd = -1;
+        goto cleanup;
+    }
+    file_fd = -1;
+    success = 1;
+
+cleanup:
+    {
+        int saved_errno = errno;
+
+        if (!success && file_fd >= 0 && may_have_written) {
+            if (ftruncate(file_fd, original_size) == 0) {
+                (void)sync_file(file_fd);
+            }
+        }
+        if (file_fd >= 0) {
+            (void)close(file_fd);
+        }
+        if (!success && created) {
+            (void)unlinkat(directory_fd, filename, 0);
+            (void)sync_directory(directory_fd);
+        }
+        storage_lock_release(&lock);
         errno = saved_errno;
     }
     return success;

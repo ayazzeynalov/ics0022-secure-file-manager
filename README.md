@@ -16,7 +16,8 @@ The current command-line application supports:
 - viewing a credential by record ID, with its password hidden unless the user
   acknowledges a terminal-output warning and explicitly requests reveal;
 - updating and deleting credentials by record ID;
-- locking the active session; and
+- locking the active session;
+- recording minimized structured security audit events; and
 - loading the same encrypted vault after restarting the program.
 
 User metadata is stored in `~/.securepm/users.db`. Each user has a separate
@@ -74,6 +75,43 @@ label, username, and notes, but keeps the password hidden unless the user types
 displays passwords. Passwords are never accepted as command-line arguments. Run
 `./securepm --help` for the command summary.
 
+## Security audit log
+
+Security events are appended to `~/.securepm/audit.log` as one JSON object per
+line. Records have a fixed schema and use UTC RFC 3339 timestamps:
+
+```json
+{"timestamp":"2026-10-29T12:34:56Z","event":"login","outcome":"success"}
+```
+
+Event names are fixed in the program and cover user registration, login, vault
+load, credential creation/update/deletion, confirmed or cancelled password
+reveal, and session lock. Outcomes are limited to `success`, `failure`, and
+`cancelled`. A modifying operation is recorded as successful only after the
+encrypted vault has been durably replaced.
+
+Audit records deliberately contain no user or account identifier, password,
+key, VMK, label, credential username, notes, record ID, verifier, salt,
+encrypted material, or other caller-controlled text. This prevents untrusted
+input from changing the JSON structure and minimizes disclosure if the log is
+read. The tradeoff is that events cannot be correlated to a particular account
+when multiple local accounts are active.
+
+The log and its stable append lock use mode `0600` inside the existing `0700`
+storage directory. Append opens reject symlinks, non-regular files, unexpected
+ownership or mode, and files with multiple hard links. A per-file advisory lock
+serializes processes; writes use `O_APPEND`, retry interruptions, handle short
+writes, synchronize completed records, and stop before the log exceeds 1 MiB.
+
+Audit logging is best effort for this educational local application. If an
+event cannot be recorded, the CLI prints a generic warning but does not change,
+roll back, or overwrite the result or error state of the primary authentication
+or vault operation. The log has no automatic rotation: after the 1 MiB bound is
+reached, events fail visibly until the user securely archives or removes the
+log. The log is not cryptographically authenticated or tamper-evident, and a
+crash or power loss can leave an incomplete final line despite runtime handling
+of ordinary partial-write errors.
+
 ## Security decisions
 
 - **Password derivation:** OpenSSL scrypt derives a 32-byte root key from the
@@ -103,6 +141,10 @@ displays passwords. Passwords are never accepted as command-line arguments. Run
 - **Concurrent access:** stable `0600` lock files serialize user registration
   and each vault's complete read-modify-write session. Data files continue to
   use atomic replacement.
+- **Audit/error handling:** fixed-enum JSON Lines events contain no identifiers
+  or sensitive fields. Audit append failures produce a generic warning without
+  changing the primary operation, while authentication and vault-load failures
+  retain generic user-facing messages.
 - **Registration recovery:** a pending marker allows an interrupted account
   creation to resume only after the same master password is authenticated.
 - **Login throttling:** failures in one interactive process take at least 0.5,
@@ -163,10 +205,12 @@ The Linux run used GCC 13.3.0 and OpenSSL 3.0.13.
   and AES-256-GCM;
 - authentication-verifier and VMK-wrapping tests;
 - POSIX storage and file-permission tests;
+- structured audit schema, minimization, append, fault, and concurrency tests;
 - user database, account, vault, and credential serialization tests; and
 - pseudo-terminal integration tests for registration, hidden input, login,
   credential retrieval, update and deletion, malformed vault handling, bounded
-  input, and terminal restoration.
+  input, terminal restoration, audit event coverage, log injection resistance,
+  and audit-write failure handling.
 
 Filesystem tests use isolated temporary `HOME` directories and dummy secrets.
 The test suite covers authentication failures, malformed and truncated files,
@@ -177,8 +221,12 @@ security audit or a benchmark of password-guessing resistance.
 
 Stored passwords are available to the authenticated process and can be revealed
 in terminal output after explicit confirmation; the application does not yet
-provide a reviewed clipboard mechanism. It also has no structured audit logging
-or password generation.
+provide a reviewed clipboard mechanism or password generation.
+
+The audit log intentionally has no account identifiers, tamper-evident chain,
+automatic rotation, or protection against modification by the same operating
+system account. Its 1 MiB bound limits resource consumption but requires manual
+archival or removal when full.
 
 Login throttling applies only within one running process. It cannot prevent a
 new process from starting fresh or slow offline attacks against stolen

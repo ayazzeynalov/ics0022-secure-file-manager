@@ -129,6 +129,23 @@ static int contains_bytes(const unsigned char *data, size_t data_length,
     return 0;
 }
 
+static size_t count_text(const unsigned char *data, size_t data_length,
+                         const char *text)
+{
+    size_t text_length = strlen(text);
+    size_t count = 0;
+
+    if (text_length == 0 || text_length > data_length) {
+        return 0;
+    }
+    for (size_t offset = 0; offset <= data_length - text_length; ++offset) {
+        if (memcmp(data + offset, text, text_length) == 0) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 static int transcript_find(struct transcript *transcript,
                            const char *expected)
 {
@@ -689,7 +706,7 @@ int main(int argc, char *argv[])
         {"Choice: ", "2\n"},
         {"No credentials.", NULL},
         {"Choice: ", "1\n"},
-        {"Label: ", "Example Service\n"},
+        {"Label: ", "Example\"},{\"event\":\"forged\n"},
         {"Credential username: ", "dummy-user\n"},
         {"Credential password: ", "dummy-credential-secret-73\n"},
         {"Notes (optional): ", "dummy notes\n"},
@@ -704,7 +721,7 @@ int main(int argc, char *argv[])
         {"Master password: ", "dummy-master-password-42\n"},
         {"Login successful.", NULL},
         {"Choice: ", "2\n"},
-        {"Label: Example Service | Username: dummy-user", NULL},
+        {"Label: Example\"},{\"event\":\"forged | Username: dummy-user", NULL},
         {"Choice: ", "7\n"}
     };
     static const struct dialog_step failed_vault_steps[] = {
@@ -716,13 +733,16 @@ int main(int argc, char *argv[])
     };
     char home_template[TEST_PATH_BYTES];
     char vault_path[TEST_PATH_BYTES];
+    char audit_path[TEST_PATH_BYTES];
     char *home;
     struct transcript transcript;
     struct stat vault_status;
     unsigned char *vault_data = NULL;
     unsigned char *after_failure = NULL;
+    unsigned char *audit_data = NULL;
     size_t vault_length = 0;
     size_t after_failure_length = 0;
+    size_t audit_length = 0;
     char record_id[TEST_RECORD_ID_BYTES * 2 + 2] = {0};
     char oversized_label[131];
     struct timespec throttle_start = {0};
@@ -776,6 +796,27 @@ int main(int argc, char *argv[])
                           (const unsigned char *)wrong_password,
                           sizeof(wrong_password) - 1));
 
+    memset(oversized_label, 'A', sizeof(oversized_label) - 2);
+    oversized_label[sizeof(oversized_label) - 2] = '\n';
+    oversized_label[sizeof(oversized_label) - 1] = '\0';
+    {
+        const struct dialog_step failed_add_steps[] = {
+            {"Choice: ", "2\n"},
+            {"Username: ", "Alice\n"},
+            {"Master password: ", "dummy-master-password-42\n"},
+            {"Login successful.", NULL},
+            {"Choice: ", "1\n"},
+            {"Label: ", oversized_label},
+            {"Input too long.", NULL},
+            {"Choice: ", "7\n"}
+        };
+
+        CHECK(run_dialog(program, home, failed_add_steps,
+                         sizeof(failed_add_steps) /
+                             sizeof(failed_add_steps[0]),
+                         &transcript));
+    }
+
     CHECK(run_dialog(program, home, add_steps,
                      sizeof(add_steps) / sizeof(add_steps[0]), &transcript));
     CHECK(!contains_bytes(transcript.data, transcript.length,
@@ -817,7 +858,7 @@ int main(int argc, char *argv[])
             {"Credential not found.", NULL},
             {"Choice: ", "3\n"},
             {"Record ID: ", record_id},
-            {"Label: Example Service", NULL},
+            {"Label: Example\"},{\"event\":\"forged", NULL},
             {"Username: dummy-user", NULL},
             {"Notes: dummy notes", NULL},
             {"Password: hidden", NULL},
@@ -835,9 +876,6 @@ int main(int argc, char *argv[])
                               (const unsigned char *)credential_password,
                               sizeof(credential_password) - 1));
 
-        memset(oversized_label, 'A', sizeof(oversized_label) - 2);
-        oversized_label[sizeof(oversized_label) - 2] = '\n';
-        oversized_label[sizeof(oversized_label) - 1] = '\0';
         {
             const struct dialog_step failed_update_steps[] = {
                 {"Choice: ", "2\n"},
@@ -849,7 +887,7 @@ int main(int argc, char *argv[])
                 {"New label: ", oversized_label},
                 {"Input too long.", NULL},
                 {"Choice: ", "2\n"},
-                {"Label: Example Service | Username: dummy-user", NULL},
+                {"Label: Example\"},{\"event\":\"forged | Username: dummy-user", NULL},
                 {"Choice: ", "7\n"}
             };
 
@@ -957,6 +995,27 @@ int main(int argc, char *argv[])
         }
     }
 
+    CHECK(make_path(audit_path, home, ".securepm/audit.log"));
+    CHECK(chmod(audit_path, 0400) == 0);
+    {
+        static const struct dialog_step audit_failure_steps[] = {
+            {"Choice: ", "2\n"},
+            {"Username: ", "Alice\n"},
+            {"Master password: ", "dummy-master-password-42\n"},
+            {"Warning: security audit event could not be recorded.", NULL},
+            {"Login successful.", NULL},
+            {"Choice: ", "2\n"},
+            {"No credentials.", NULL},
+            {"Choice: ", "7\n"}
+        };
+
+        CHECK(run_dialog(program, home, audit_failure_steps,
+                         sizeof(audit_failure_steps) /
+                             sizeof(audit_failure_steps[0]),
+                         &transcript));
+    }
+    CHECK(chmod(audit_path, 0600) == 0);
+
     vault_data = read_file(vault_path, &vault_length);
     CHECK(vault_data != NULL && vault_length != 0);
     if (vault_data != NULL && vault_length != 0) {
@@ -987,6 +1046,52 @@ int main(int argc, char *argv[])
     free(vault_data);
     test_interrupted_secret(program, home);
     test_eof_at_secret(program, home);
+    audit_data = read_file(audit_path, &audit_length);
+    CHECK(audit_data != NULL && audit_length != 0);
+    if (audit_data != NULL) {
+        static const char *const required_events[] = {
+            "\"event\":\"user_registration\",\"outcome\":\"success\"",
+            "\"event\":\"user_registration\",\"outcome\":\"failure\"",
+            "\"event\":\"login\",\"outcome\":\"success\"",
+            "\"event\":\"login\",\"outcome\":\"failure\"",
+            "\"event\":\"vault_load\",\"outcome\":\"failure\"",
+            "\"event\":\"credential_create\",\"outcome\":\"success\"",
+            "\"event\":\"credential_create\",\"outcome\":\"failure\"",
+            "\"event\":\"credential_update\",\"outcome\":\"success\"",
+            "\"event\":\"credential_update\",\"outcome\":\"failure\"",
+            "\"event\":\"credential_delete\",\"outcome\":\"success\"",
+            "\"event\":\"credential_delete\",\"outcome\":\"failure\"",
+            "\"event\":\"credential_delete\",\"outcome\":\"cancelled\"",
+            "\"event\":\"password_reveal\",\"outcome\":\"success\"",
+            "\"event\":\"password_reveal\",\"outcome\":\"cancelled\"",
+            "\"event\":\"session_lock\",\"outcome\":\"success\""
+        };
+        static const char *const forbidden_values[] = {
+            master_password, wrong_password, credential_password,
+            updated_password, "Alice", "dummy-user", "updated-user",
+            "dummy notes", "updated notes", "\"event\":\"forged"
+        };
+
+        for (size_t index = 0;
+             index < sizeof(required_events) / sizeof(required_events[0]);
+             ++index) {
+            CHECK(count_text(audit_data, audit_length,
+                             required_events[index]) != 0);
+        }
+        for (size_t index = 0;
+             index < sizeof(forbidden_values) / sizeof(forbidden_values[0]);
+             ++index) {
+            CHECK(!contains_bytes(audit_data, audit_length,
+                                  (const unsigned char *)forbidden_values[index],
+                                  strlen(forbidden_values[index])));
+        }
+        if (record_id[0] != '\0') {
+            CHECK(!contains_bytes(audit_data, audit_length,
+                                  (const unsigned char *)record_id,
+                                  TEST_RECORD_ID_BYTES * 2));
+        }
+    }
+    free(audit_data);
     CHECK(remove_tree(home));
     test_registration_vault_failure(program);
 

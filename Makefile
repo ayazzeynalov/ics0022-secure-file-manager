@@ -17,12 +17,13 @@ OPENSSL_LIBS ?= -lcrypto
 
 TARGET = securepm
 SRC = src/main.c src/cli.c src/input.c src/crypto.c src/auth.c src/storage.c \
+	src/audit.c \
 	src/user_db.c src/account.c src/vault.c src/credentials.c
 OBJ = $(SRC:src/%.c=build/%.o)
 DEP = $(OBJ:.o=.d) build/test_crypto.d build/test_auth.d build/test_storage.d \
 	build/test_user_db.d build/test_account.d build/test_vault.d \
 	build/test_credentials.d build/test_cli.d build/test_input.d \
-	build/storage_test.d
+	build/test_audit.d build/storage_test.d
 
 .PHONY: all clean test check-openssl
 all: $(TARGET)
@@ -58,6 +59,12 @@ build/test_storage.o: tests/test_storage.c | build check-openssl
 	$(CC) $(CPPFLAGS) -Isrc $(OPENSSL_CFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
 
 build/test_storage: build/test_storage.o build/storage.o | check-openssl
+	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+build/test_audit.o: tests/test_audit.c | build check-openssl
+	$(CC) $(CPPFLAGS) -Isrc $(OPENSSL_CFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
+
+build/test_audit: build/test_audit.o build/audit.o build/storage_test.o | check-openssl
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
 build/test_user_db.o: tests/test_user_db.c | build check-openssl
@@ -106,12 +113,13 @@ build/test_input: build/test_input.o build/input.o | check-openssl
 
 test: $(TARGET) build/test_crypto build/test_auth build/test_storage \
 		build/test_user_db build/test_account build/test_vault \
-		build/test_credentials build/test_cli build/test_input
+		build/test_credentials build/test_cli build/test_input build/test_audit
 	sh tests/smoke.sh ./$(TARGET)
 	./build/test_input
 	./build/test_crypto
 	./build/test_auth
 	./build/test_storage
+	./build/test_audit
 	./build/test_user_db
 	./build/test_account
 	./build/test_vault

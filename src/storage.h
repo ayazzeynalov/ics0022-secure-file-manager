@@ -52,6 +52,15 @@ void storage_free(void *data);
 int storage_atomic_write(const struct storage *storage, enum storage_area area,
                          const char *filename,
                          const unsigned char *data, size_t data_length);
+
+/* Appends while holding a stable per-file lock. Existing files must satisfy
+ * the same regular-file, owner, mode and single-link checks as other storage
+ * objects. The complete file, including the new data, is bounded by
+ * maximum_size. */
+int storage_append_file(const struct storage *storage, enum storage_area area,
+                        const char *filename,
+                        const unsigned char *data, size_t data_length,
+                        size_t maximum_size);
 int storage_remove_file(const struct storage *storage, enum storage_area area,
                         const char *filename);
 
