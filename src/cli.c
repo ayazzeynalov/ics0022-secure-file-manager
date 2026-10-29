@@ -328,7 +328,9 @@ static int view_credential(const struct account_session *session,
                            const struct credential_collection *collection)
 {
     unsigned char record_id[CREDENTIALS_RECORD_ID_BYTES] = {0};
+    char confirmation[8] = {0};
     const struct credential_record *record;
+    size_t confirmation_length = 0;
     int read_result;
     int action = ACTION_CONTINUE;
 
@@ -355,9 +357,25 @@ static int view_credential(const struct account_session *session,
     fputs("\nNotes: ", stdout);
     print_safe_field(record->notes, record->notes_length);
     fputs("\nPassword: hidden\n", stdout);
+    puts("Warning: revealed passwords may remain visible in terminal output.");
+    read_result = read_value("Type yes to reveal password: ", confirmation,
+                             sizeof(confirmation), &confirmation_length, 0);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        goto cleanup;
+    }
+    if (confirmation_length != 3 ||
+        memcmp(confirmation, "yes", 3) != 0) {
+        puts("Password remains hidden.");
+        goto cleanup;
+    }
+    fputs("Password: ", stdout);
+    print_safe_field(record->password, record->password_length);
+    putchar('\n');
 
 cleanup:
     OPENSSL_cleanse(record_id, sizeof(record_id));
+    OPENSSL_cleanse(confirmation, sizeof(confirmation));
     return action;
 }
 

@@ -13,7 +13,8 @@ The current command-line application supports:
 - adding credentials with a label, username, password, and optional notes;
 - listing credential record IDs, labels, and usernames without displaying
   passwords;
-- viewing a credential's non-secret details by record ID;
+- viewing a credential by record ID, with its password hidden unless the user
+  acknowledges a terminal-output warning and explicitly requests reveal;
 - updating and deleting credentials by record ID;
 - locking the active session; and
 - loading the same encrypted vault after restarting the program.
@@ -68,8 +69,9 @@ Vault menu:
 
 Adding, updating, or deleting a credential rewrites the encrypted vault
 atomically while the user's vault lock is held. Viewing displays the record ID,
-label, username, and notes. Listing and viewing do not display stored
-passwords. Passwords are never accepted as command-line arguments. Run
+label, username, and notes, but keeps the password hidden unless the user types
+`yes` after a warning that terminal output may remain visible. Listing never
+displays passwords. Passwords are never accepted as command-line arguments. Run
 `./securepm --help` for the command summary.
 
 ## Security decisions
@@ -171,10 +173,10 @@ security audit or a benchmark of password-guessing resistance.
 
 ## Remaining limitations and planned work
 
-Stored passwords are available to the authenticated process but are not shown
-by the CLI. There is no reviewed clipboard or other secret-output mechanism
-yet. The application also has no structured audit logging or password
-generation.
+Stored passwords are available to the authenticated process and can be revealed
+in terminal output after explicit confirmation; the application does not yet
+provide a reviewed clipboard mechanism. It also has no structured audit logging
+or password generation.
 
 Login throttling applies only within one running process. It cannot prevent a
 new process from starting fresh or slow offline attacks against stolen

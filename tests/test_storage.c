@@ -391,6 +391,7 @@ static void test_oversized_file(const struct storage *storage, const char *home)
 static void test_failed_write_cleanup(const struct storage *storage,
                                       const char *home)
 {
+    static const unsigned char existing[] = "preserved data";
     static const unsigned char data[] = "failure data";
     struct rlimit original_limit;
     struct rlimit small_limit;
@@ -403,6 +404,8 @@ static void test_failed_write_cleanup(const struct storage *storage,
     int signal_ready;
 
     CHECK(make_path(root, home, ".securepm"));
+    CHECK(storage_atomic_write(storage, STORAGE_AREA_ROOT, "failed.db",
+                               existing, sizeof(existing) - 1) == 1);
     limit_ready = getrlimit(RLIMIT_FSIZE, &original_limit) == 0;
     CHECK(limit_ready);
     ignore_action.sa_handler = SIG_IGN;
@@ -418,7 +421,12 @@ static void test_failed_write_cleanup(const struct storage *storage,
         CHECK(setrlimit(RLIMIT_FSIZE, &original_limit) == 0);
         CHECK(sigaction(SIGXFSZ, &original_action, NULL) == 0);
         CHECK(storage_read_file(storage, STORAGE_AREA_ROOT, "failed.db", 1024,
-                                &read_data, &read_length) == STORAGE_READ_MISSING);
+                                &read_data, &read_length) == STORAGE_READ_OK);
+        CHECK(read_length == sizeof(existing) - 1);
+        if (read_data != NULL && read_length == sizeof(existing) - 1) {
+            CHECK(memcmp(read_data, existing, read_length) == 0);
+        }
+        storage_free(read_data);
         CHECK(!directory_has_temporary_file(root));
     }
 }

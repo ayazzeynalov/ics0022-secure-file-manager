@@ -803,12 +803,22 @@ int main(int argc, char *argv[])
             {"Choice: ", "3\n"},
             {"Record ID: ", missing_id},
             {"Credential not found.", NULL},
+            {"Choice: ", "4\n"},
+            {"Record ID: ", missing_id},
+            {"Credential not found.", NULL},
+            {"Choice: ", "5\n"},
+            {"Record ID: ", missing_id},
+            {"Credential not found.", NULL},
             {"Choice: ", "3\n"},
             {"Record ID: ", record_id},
             {"Label: Example Service", NULL},
             {"Username: dummy-user", NULL},
             {"Notes: dummy notes", NULL},
             {"Password: hidden", NULL},
+            {"Warning: revealed passwords may remain visible in terminal "
+             "output.", NULL},
+            {"Type yes to reveal password: ", "no\n"},
+            {"Password remains hidden.", NULL},
             {"Choice: ", "7\n"}
         };
 
@@ -880,6 +890,10 @@ int main(int argc, char *argv[])
                 {"Record ID: ", record_id},
                 {"Notes: updated notes", NULL},
                 {"Password: hidden", NULL},
+                {"Warning: revealed passwords may remain visible in terminal "
+                 "output.", NULL},
+                {"Type yes to reveal password: ", "yes\n"},
+                {"Password: updated-dummy-secret-91", NULL},
                 {"Choice: ", "7\n"}
             };
 
@@ -890,9 +904,9 @@ int main(int argc, char *argv[])
             CHECK(!contains_bytes(transcript.data, transcript.length,
                                   (const unsigned char *)credential_password,
                                   sizeof(credential_password) - 1));
-            CHECK(!contains_bytes(transcript.data, transcript.length,
-                                  (const unsigned char *)updated_password,
-                                  sizeof(updated_password) - 1));
+            CHECK(contains_bytes(transcript.data, transcript.length,
+                                 (const unsigned char *)updated_password,
+                                 sizeof(updated_password) - 1));
         }
         {
             const struct dialog_step delete_steps[] = {
