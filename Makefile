@@ -21,7 +21,8 @@ SRC = src/main.c src/cli.c src/input.c src/crypto.c src/auth.c src/storage.c \
 OBJ = $(SRC:src/%.c=build/%.o)
 DEP = $(OBJ:.o=.d) build/test_crypto.d build/test_auth.d build/test_storage.d \
 	build/test_user_db.d build/test_account.d build/test_vault.d \
-	build/test_credentials.d build/test_cli.d build/storage_test.d
+	build/test_credentials.d build/test_cli.d build/test_input.d \
+	build/storage_test.d
 
 .PHONY: all clean test check-openssl
 all: $(TARGET)
@@ -97,10 +98,17 @@ build/test_cli.o: tests/test_cli.c | build
 build/test_cli: build/test_cli.o
 	$(CC) $(LDFLAGS) $^ $(PTY_LIBS) $(LDLIBS) -o $@
 
+build/test_input.o: tests/test_input.c | build check-openssl
+	$(CC) $(CPPFLAGS) -Isrc $(OPENSSL_CFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
+
+build/test_input: build/test_input.o build/input.o | check-openssl
+	$(CC) $(LDFLAGS) $^ $(OPENSSL_LIBS) $(LDLIBS) -o $@
+
 test: $(TARGET) build/test_crypto build/test_auth build/test_storage \
 		build/test_user_db build/test_account build/test_vault \
-		build/test_credentials build/test_cli
+		build/test_credentials build/test_cli build/test_input
 	sh tests/smoke.sh ./$(TARGET)
+	./build/test_input
 	./build/test_crypto
 	./build/test_auth
 	./build/test_storage

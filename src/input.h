@@ -13,6 +13,9 @@
 int input_initialize(void);
 void input_cleanup(void);
 
+/* Successful reads return a NUL-terminated byte string and explicit length.
+ * Every non-successful read clears a valid destination buffer and sets its
+ * length to zero. Embedded NUL bytes are rejected. */
 int input_read_line(const char *prompt, char *buffer, size_t capacity,
                     size_t *length);
 int input_read_secret(const char *prompt, char *buffer, size_t capacity,

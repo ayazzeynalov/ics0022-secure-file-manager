@@ -436,6 +436,7 @@ static int overwrite_file(const char *path, const unsigned char *data,
 
 static void test_interrupted_secret(const char *program, const char *home)
 {
+    static const char partial_password[] = "partial-dummy-secret";
     struct transcript transcript = {{0}, 0, 0};
     struct termios terminal;
     int master = -1;
@@ -451,11 +452,16 @@ static void test_interrupted_secret(const char *program, const char *home)
     CHECK(wait_for_text(master, &transcript, "Username: "));
     CHECK(write_all(master, "Alice\n"));
     CHECK(wait_for_text(master, &transcript, "Master password: "));
+    CHECK(write_bytes(master, (const unsigned char *)partial_password,
+                      sizeof(partial_password) - 1));
     CHECK(kill(child, SIGINT) == 0);
     CHECK(wait_for_exit(child, master, &status));
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 128 + SIGINT);
     CHECK(tcgetattr(master, &terminal) == 0);
     CHECK((terminal.c_lflag & ECHO) != 0);
+    CHECK(!contains_bytes(transcript.data, transcript.length,
+                          (const unsigned char *)partial_password,
+                          sizeof(partial_password) - 1));
     close(master);
 }
 

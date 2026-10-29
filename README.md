@@ -94,10 +94,12 @@ displays passwords. Passwords are never accepted as command-line arguments. Run
   and embedded NUL bytes. Binary formats validate lengths, counts, versions,
   integer conversions, truncation, trailing data, and maximum sizes before
   copying or allocating.
-- **Secret handling:** password input uses disabled terminal echo, and terminal
-  settings are restored after normal input, EOF, errors, or handled signals.
-  Password-derived keys, plaintext payloads, credential collections, and
-  session VMKs are cleared with OpenSSL cleanup functions when released.
+- **Secret handling:** password input uses disabled terminal echo and unbuffered
+  descriptor reads. Failed input buffers are cleared immediately, and unread
+  terminal input is flushed when terminal settings are restored after normal
+  input, EOF, errors, or handled signals. Password-derived keys, plaintext
+  payloads, credential collections, and session VMKs are cleared with OpenSSL
+  cleanup functions when released.
 - **Concurrent access:** stable `0600` lock files serialize user registration
   and each vault's complete read-modify-write session. Data files continue to
   use atomic replacement.
