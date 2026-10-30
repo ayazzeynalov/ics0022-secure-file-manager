@@ -165,6 +165,8 @@ static void check_locked(const struct account_session *session)
     CHECK(session->unlocked == 0);
     CHECK(all_zero(session->user_id, sizeof(session->user_id)));
     CHECK(all_zero(session->vmk, sizeof(session->vmk)));
+    CHECK(all_zero(session->authenticator, sizeof(session->authenticator)));
+    CHECK(account_session_is_valid(session) == 0);
 }
 
 static void test_invalid_inputs(const struct storage *storage,
@@ -359,9 +361,12 @@ static void test_unlock_and_no_plaintext(
                          alice_password, alice_password_length,
                          session) == 1);
     CHECK(session->unlocked == 1);
+    CHECK(account_session_is_valid(session) == 1);
     CHECK(memcmp(session->user_id, alice_record->user_id,
                  sizeof(session->user_id)) == 0);
     CHECK(!all_zero(session->vmk, sizeof(session->vmk)));
+    CHECK(!all_zero(session->authenticator,
+                    sizeof(session->authenticator)));
 
     CHECK(storage_read_file(storage, STORAGE_AREA_ROOT, USER_DB_FILENAME,
                             STORAGE_MAX_FILE_BYTES, &serialized,
@@ -479,6 +484,51 @@ static void test_session_lock(struct account_session *session)
     check_locked(session);
 }
 
+static void test_session_authenticator(
+    const struct storage *storage,
+    const char *alice_password, size_t alice_password_length,
+    const char *carol_password, size_t carol_password_length,
+    struct account_session *session)
+{
+    struct account_session modified;
+    struct account_session fabricated;
+    unsigned char alice_user_id[USER_DB_USER_ID_BYTES];
+
+    CHECK(account_unlock(storage, "Alice", 5,
+                         alice_password, alice_password_length,
+                         session) == 1);
+    CHECK(account_session_is_valid(session) == 1);
+    memcpy(alice_user_id, session->user_id, sizeof(alice_user_id));
+
+    modified = *session;
+    modified.user_id[0] ^= 1;
+    CHECK(account_session_is_valid(&modified) == 0);
+    modified = *session;
+    modified.vmk[0] ^= 1;
+    CHECK(account_session_is_valid(&modified) == 0);
+    modified = *session;
+    modified.authenticator[0] ^= 1;
+    CHECK(account_session_is_valid(&modified) == 0);
+
+    memset(&fabricated, 0xa5, sizeof(fabricated));
+    fabricated.unlocked = 1;
+    CHECK(account_session_is_valid(&fabricated) == 0);
+
+    CHECK(account_unlock(storage, "Carol", 5,
+                         carol_password, carol_password_length,
+                         session) == 1);
+    CHECK(account_session_is_valid(session) == 1);
+    CHECK(memcmp(session->user_id, alice_user_id,
+                 sizeof(alice_user_id)) != 0);
+    CHECK(account_unlock(storage, "Alice", 5,
+                         carol_password, carol_password_length,
+                         session) == 0);
+    check_locked(session);
+    OPENSSL_cleanse(&modified, sizeof(modified));
+    OPENSSL_cleanse(&fabricated, sizeof(fabricated));
+    OPENSSL_cleanse(alice_user_id, sizeof(alice_user_id));
+}
+
 static void test_ambiguous_registration_commit(const char *original_home)
 {
     char password[] = "dummy-ambiguous-commit-password";
@@ -562,6 +612,10 @@ int main(void)
         test_corrupted_record(&storage,
                               alice_password, alice_password_length,
                               &alice_record, &session);
+        test_session_authenticator(&storage,
+                                   alice_password, alice_password_length,
+                                   carol_password, carol_password_length,
+                                   &session);
         test_legacy_short_password(&storage, &session);
         test_session_lock(&session);
         test_malformed_database(&storage,

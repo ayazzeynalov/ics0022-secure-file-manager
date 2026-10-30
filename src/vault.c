@@ -26,7 +26,7 @@ static const unsigned char vault_magic[VAULT_MAGIC_BYTES] = {
 
 static int valid_session(const struct account_session *session)
 {
-    return session != NULL && session->unlocked == 1;
+    return account_session_is_valid(session);
 }
 
 static int user_file_name(const unsigned char user_id[USER_DB_USER_ID_BYTES],

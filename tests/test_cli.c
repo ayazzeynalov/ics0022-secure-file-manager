@@ -652,6 +652,8 @@ int main(int argc, char *argv[])
     static const char credential_password[] = "dummy-credential-secret-73";
     static const char updated_password[] = "updated-dummy-secret-91";
     static const char mismatch_password[] = "dummy-mismatch-password";
+    static const char bob_master_password[] = "dummy-bob-master-password";
+    static const char bob_credential_password[] = "dummy-bob-secret-58";
     static const struct dialog_step oversized_steps[] = {
         {"Choice: ", "1\n"},
         {"Username: ",
@@ -744,6 +746,7 @@ int main(int argc, char *argv[])
     size_t after_failure_length = 0;
     size_t audit_length = 0;
     char record_id[TEST_RECORD_ID_BYTES * 2 + 2] = {0};
+    char bob_record_id[TEST_RECORD_ID_BYTES * 2 + 2] = {0};
     char oversized_label[131];
     struct timespec throttle_start = {0};
     struct timespec throttle_end = {0};
@@ -835,6 +838,132 @@ int main(int argc, char *argv[])
                           (const unsigned char *)credential_password,
                           sizeof(credential_password) - 1));
     CHECK(extract_record_id(&transcript, record_id));
+
+    {
+        static const struct dialog_step register_bob_steps[] = {
+            {"Choice: ", "1\n"},
+            {"Username: ", "Bob\n"},
+            {"Master password: ", "dummy-bob-master-password\n"},
+            {"Confirm master password: ", "dummy-bob-master-password\n"},
+            {"User created.", NULL},
+            {"Choice: ", "3\n"}
+        };
+        static const struct dialog_step add_bob_steps[] = {
+            {"Choice: ", "2\n"},
+            {"Username: ", "Bob\n"},
+            {"Master password: ", "dummy-bob-master-password\n"},
+            {"Login successful.", NULL},
+            {"Choice: ", "1\n"},
+            {"Label: ", "Example\"},{\"event\":\"forged\n"},
+            {"Credential username: ", "dummy-user\n"},
+            {"Credential password: ", "dummy-bob-secret-58\n"},
+            {"Notes (optional): ", "bob private notes\n"},
+            {"Credential added.", NULL},
+            {"Choice: ", "2\n"},
+            {"Label: Example\"},{\"event\":\"forged | Username: dummy-user", NULL},
+            {"Choice: ", "7\n"}
+        };
+
+        CHECK(run_dialog(program, home, register_bob_steps,
+                         sizeof(register_bob_steps) /
+                             sizeof(register_bob_steps[0]),
+                         &transcript));
+        CHECK(!contains_bytes(transcript.data, transcript.length,
+                              (const unsigned char *)bob_master_password,
+                              sizeof(bob_master_password) - 1));
+        CHECK(run_dialog(program, home, add_bob_steps,
+                         sizeof(add_bob_steps) / sizeof(add_bob_steps[0]),
+                         &transcript));
+        CHECK(extract_record_id(&transcript, bob_record_id));
+        CHECK(!contains_bytes(transcript.data, transcript.length,
+                              (const unsigned char *)bob_credential_password,
+                              sizeof(bob_credential_password) - 1));
+    }
+
+    if (record_id[0] != '\0' && bob_record_id[0] != '\0') {
+        const struct dialog_step cross_user_steps[] = {
+            {"Choice: ", "2\n"},
+            {"Username: ", "Bob\n"},
+            {"Master password: ", "dummy-bob-master-password\n"},
+            {"Login successful.", NULL},
+            {"Choice: ", "3\n"},
+            {"Record ID: ", record_id},
+            {"Credential not found.", NULL},
+            {"Choice: ", "4\n"},
+            {"Record ID: ", record_id},
+            {"Credential not found.", NULL},
+            {"Choice: ", "5\n"},
+            {"Record ID: ", record_id},
+            {"Credential not found.", NULL},
+            {"Choice: ", "2\n"},
+            {"Label: Example\"},{\"event\":\"forged | Username: dummy-user", NULL},
+            {"Choice: ", "6\n"},
+            {"Vault locked.", NULL},
+            {"Choice: ", "4\n"},
+            {"Invalid choice.", NULL},
+            {"Choice: ", "2\n"},
+            {"Username: ", "Alice\n"},
+            {"Master password: ", "dummy-master-password-42\n"},
+            {"Login successful.", NULL},
+            {"Choice: ", "3\n"},
+            {"Record ID: ", bob_record_id},
+            {"Credential not found.", NULL},
+            {"Choice: ", "4\n"},
+            {"Record ID: ", bob_record_id},
+            {"Credential not found.", NULL},
+            {"Choice: ", "5\n"},
+            {"Record ID: ", bob_record_id},
+            {"Credential not found.", NULL},
+            {"Choice: ", "2\n"},
+            {"Label: Example\"},{\"event\":\"forged | Username: dummy-user", NULL},
+            {"Choice: ", "7\n"}
+        };
+        const struct dialog_step verify_bob_steps[] = {
+            {"Choice: ", "2\n"},
+            {"Username: ", "Bob\n"},
+            {"Master password: ", "dummy-bob-master-password\n"},
+            {"Login successful.", NULL},
+            {"Choice: ", "3\n"},
+            {"Record ID: ", bob_record_id},
+            {"Notes: bob private notes", NULL},
+            {"Password: hidden", NULL},
+            {"Type yes to reveal password: ", "yes\n"},
+            {"Password: dummy-bob-secret-58", NULL},
+            {"Choice: ", "7\n"}
+        };
+        static const struct dialog_step failed_bob_login_steps[] = {
+            {"Choice: ", "2\n"},
+            {"Username: ", "Bob\n"},
+            {"Master password: ", "dummy-wrong-password\n"},
+            {"Login failed.", NULL},
+            {"Choice: ", "3\n"}
+        };
+
+        CHECK(run_dialog(program, home, cross_user_steps,
+                         sizeof(cross_user_steps) /
+                             sizeof(cross_user_steps[0]),
+                         &transcript));
+        CHECK(!contains_bytes(transcript.data, transcript.length,
+                              (const unsigned char *)credential_password,
+                              sizeof(credential_password) - 1));
+        CHECK(!contains_bytes(transcript.data, transcript.length,
+                              (const unsigned char *)bob_credential_password,
+                              sizeof(bob_credential_password) - 1));
+        CHECK(run_dialog(program, home, failed_bob_login_steps,
+                         sizeof(failed_bob_login_steps) /
+                             sizeof(failed_bob_login_steps[0]),
+                         &transcript));
+        CHECK(run_dialog(program, home, verify_bob_steps,
+                         sizeof(verify_bob_steps) /
+                             sizeof(verify_bob_steps[0]),
+                         &transcript));
+        CHECK(contains_bytes(transcript.data, transcript.length,
+                             (const unsigned char *)bob_credential_password,
+                             sizeof(bob_credential_password) - 1));
+        CHECK(!contains_bytes(transcript.data, transcript.length,
+                              (const unsigned char *)credential_password,
+                              sizeof(credential_password) - 1));
+    }
 
     if (record_id[0] != '\0') {
         static const char missing_id[] =
@@ -1068,8 +1197,9 @@ int main(int argc, char *argv[])
         };
         static const char *const forbidden_values[] = {
             master_password, wrong_password, credential_password,
-            updated_password, "Alice", "dummy-user", "updated-user",
-            "dummy notes", "updated notes", "\"event\":\"forged"
+            updated_password, bob_master_password, bob_credential_password,
+            "Alice", "Bob", "dummy-user", "updated-user", "dummy notes",
+            "updated notes", "bob private notes", "\"event\":\"forged"
         };
 
         for (size_t index = 0;

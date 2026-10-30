@@ -75,6 +75,40 @@ label, username, and notes, but keeps the password hidden unless the user types
 displays passwords. Passwords are never accepted as command-line arguments. Run
 `./securepm --help` for the command summary.
 
+## Per-user access control
+
+Application accounts are isolated by authentication, session state, separate
+Vault Master Keys, and separate encrypted vault files. Successful login unwraps
+only the selected account's VMK and issues an in-process session capability
+cryptographically bound to that account's user ID and VMK. Vault and CLI entry
+points reject locked, modified, or fabricated session structures; locking or a
+failed subsequent login clears the user ID, VMK, and capability.
+
+Each vault filename is derived from its account's random 16-byte user ID. The
+same user ID, format version, and ciphertext length are authenticated as
+AES-256-GCM additional data, while each account has an independently generated
+VMK. Substituting another account's valid vault, changing authenticated metadata,
+or using the wrong session therefore fails authentication without publishing
+plaintext. Per-user lock filenames serialize each account's read-modify-write
+operations independently.
+
+After vault authentication, CRUD and password-reveal lookups operate only on
+the current session's decrypted credential collection. Record IDs are not
+global references: knowing an ID from another vault does not grant access, and
+there is no cross-vault credential lookup. The lower-level credential collection
+module only transforms memory supplied by its trusted caller; the CLI and vault
+layers are the authorization boundary that controls which collection can be
+obtained and persisted.
+
+This is application-level isolation between password-manager accounts, not a
+separate operating-system privilege boundary. All encrypted vaults belong to
+the same OS user under `~/.securepm`. Mode `0700` directories and `0600` files
+restrict other OS users, but cannot stop a malicious process already running as
+the same OS user from copying, deleting, replacing, or rolling back files, or
+from inspecting this process's memory. The in-process session capability guards
+against accidental or fabricated internal API use; it is not a sandbox against
+malicious code executing inside the password-manager process.
+
 ## Security audit log
 
 Security events are appended to `~/.securepm/audit.log` as one JSON object per
@@ -206,6 +240,8 @@ The Linux run used GCC 13.3.0 and OpenSSL 3.0.13.
 - authentication-verifier and VMK-wrapping tests;
 - POSIX storage and file-permission tests;
 - structured audit schema, minimization, append, fault, and concurrency tests;
+- two-account access-control, session-capability, cross-record, vault
+  substitution, tampering, and restart-isolation tests;
 - user database, account, vault, and credential serialization tests; and
 - pseudo-terminal integration tests for registration, hidden input, login,
   credential retrieval, update and deletion, malformed vault handling, bounded
@@ -227,6 +263,12 @@ The audit log intentionally has no account identifiers, tamper-evident chain,
 automatic rotation, or protection against modification by the same operating
 system account. Its 1 MiB bound limits resource consumption but requires manual
 archival or removal when full.
+
+Per-user cryptographic authentication rejects a substituted vault, but cannot
+prevent the same OS user from deleting a vault or rolling back both account
+metadata and a vault to an older mutually valid state. A privileged debugger,
+in-process code execution, or another process with the same user's memory-access
+rights is outside the application-account isolation boundary.
 
 Login throttling applies only within one running process. It cannot prevent a
 new process from starting fresh or slow offline attacks against stolen

@@ -120,7 +120,7 @@ static int serialize_and_write(const struct storage *storage,
     size_t payload_length = 0;
     int success = 0;
 
-    if (session == NULL || session->unlocked != 1 ||
+    if (!account_session_is_valid(session) ||
         !credentials_serialize(collection, &payload, &payload_length)) {
         goto cleanup;
     }
@@ -330,7 +330,7 @@ static int read_record_id(unsigned char record_id[CREDENTIALS_RECORD_ID_BYTES])
 static void list_credentials(const struct account_session *session,
                              const struct credential_collection *collection)
 {
-    if (session == NULL || session->unlocked != 1 || collection == NULL) {
+    if (!account_session_is_valid(session) || collection == NULL) {
         puts("Vault is locked.");
         return;
     }
@@ -362,7 +362,7 @@ static int view_credential(const struct storage *storage,
     int read_result;
     int action = ACTION_CONTINUE;
 
-    if (session == NULL || session->unlocked != 1 || collection == NULL) {
+    if (!account_session_is_valid(session) || collection == NULL) {
         puts("Vault is locked.");
         return action;
     }
@@ -430,7 +430,7 @@ static int add_credential(const struct storage *storage,
     enum audit_outcome audit_outcome = AUDIT_OUTCOME_FAILURE;
 
     memset(password, 0, sizeof(password));
-    if (session == NULL || session->unlocked != 1) {
+    if (!account_session_is_valid(session)) {
         puts("Vault is locked.");
         goto cleanup;
     }
@@ -528,7 +528,7 @@ static int update_credential(const struct storage *storage,
     enum audit_outcome audit_outcome = AUDIT_OUTCOME_FAILURE;
 
     memset(password, 0, sizeof(password));
-    if (session == NULL || session->unlocked != 1) {
+    if (!account_session_is_valid(session)) {
         puts("Vault is locked.");
         goto cleanup;
     }
@@ -630,7 +630,7 @@ static int delete_credential(const struct storage *storage,
     int action = ACTION_CONTINUE;
     enum audit_outcome audit_outcome = AUDIT_OUTCOME_FAILURE;
 
-    if (session == NULL || session->unlocked != 1) {
+    if (!account_session_is_valid(session)) {
         puts("Vault is locked.");
         goto cleanup;
     }
@@ -694,7 +694,7 @@ static int authenticated_menu(
     char choice[MENU_INPUT_BYTES];
     size_t choice_length;
 
-    while (session->unlocked == 1) {
+    while (account_session_is_valid(session)) {
         int read_result;
 
         puts("\nVault menu:");

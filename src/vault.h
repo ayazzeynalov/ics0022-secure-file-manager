@@ -18,8 +18,9 @@ int vault_lock_acquire(const struct storage *storage,
                        const struct account_session *session,
                        struct storage_lock *lock);
 
-/* Writes require an unlocked session. NULL plaintext is accepted only for an
- * explicitly encrypted empty payload. The file is replaced atomically. */
+/* Writes require an authenticated, unlocked session capability. NULL plaintext
+ * is accepted only for an explicitly encrypted empty payload. The file is
+ * replaced atomically. */
 int vault_write(const struct storage *storage,
                 const struct account_session *session,
                 const unsigned char *plaintext, size_t plaintext_length);

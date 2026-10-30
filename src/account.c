@@ -13,10 +13,65 @@
 #define ACCOUNT_PENDING_ERROR (-1)
 #define ACCOUNT_PENDING_MISSING 0
 #define ACCOUNT_PENDING_PRESENT 1
+#define ACCOUNT_SESSION_CONTEXT "securepm:session-capability:v1"
 
 static const unsigned char pending_magic[] = {
     'S', 'P', 'M', 'P', 'E', 'N', 'D', '1'
 };
+
+static unsigned char session_secret[CRYPTO_KEY_BYTES];
+static int session_secret_ready;
+
+static int create_session_authenticator(
+    const unsigned char user_id[USER_DB_USER_ID_BYTES],
+    const unsigned char vmk[AUTH_VMK_BYTES],
+    unsigned char authenticator[ACCOUNT_SESSION_AUTHENTICATOR_BYTES])
+{
+    static const unsigned char prefix[] = ACCOUNT_SESSION_CONTEXT;
+    unsigned char context[sizeof(prefix) - 1 + USER_DB_USER_ID_BYTES +
+                          AUTH_VMK_BYTES];
+    size_t position = 0;
+    int success = 0;
+
+    if (user_id == NULL || vmk == NULL || authenticator == NULL) {
+        return 0;
+    }
+    if (!session_secret_ready) {
+        if (!crypto_random(session_secret, sizeof(session_secret))) {
+            goto cleanup;
+        }
+        session_secret_ready = 1;
+    }
+    memcpy(context + position, prefix, sizeof(prefix) - 1);
+    position += sizeof(prefix) - 1;
+    memcpy(context + position, user_id, USER_DB_USER_ID_BYTES);
+    position += USER_DB_USER_ID_BYTES;
+    memcpy(context + position, vmk, AUTH_VMK_BYTES);
+    position += AUTH_VMK_BYTES;
+    success = crypto_hkdf_sha256(
+        session_secret, sizeof(session_secret), NULL, 0,
+        context, position, authenticator,
+        ACCOUNT_SESSION_AUTHENTICATOR_BYTES);
+
+cleanup:
+    OPENSSL_cleanse(context, sizeof(context));
+    return success;
+}
+
+int account_session_is_valid(const struct account_session *session)
+{
+    unsigned char expected[ACCOUNT_SESSION_AUTHENTICATOR_BYTES] = {0};
+    int valid = 0;
+
+    if (session != NULL && session->unlocked == 1 && session_secret_ready &&
+        create_session_authenticator(session->user_id, session->vmk,
+                                     expected)) {
+        valid = CRYPTO_memcmp(expected, session->authenticator,
+                              sizeof(expected)) == 0;
+    }
+    OPENSSL_cleanse(expected, sizeof(expected));
+    return valid;
+}
 
 static int pending_filename(
     const unsigned char user_id[USER_DB_USER_ID_BYTES],
@@ -156,6 +211,7 @@ void account_session_lock(struct account_session *session)
     }
     OPENSSL_cleanse(session->vmk, sizeof(session->vmk));
     OPENSSL_cleanse(session->user_id, sizeof(session->user_id));
+    OPENSSL_cleanse(session->authenticator, sizeof(session->authenticator));
     session->unlocked = 0;
 }
 
@@ -273,7 +329,7 @@ int account_registration_complete(const struct storage *storage,
     int success = 0;
 
     user_db_init(&database);
-    if (storage == NULL || session == NULL || session->unlocked != 1 ||
+    if (storage == NULL || !account_session_is_valid(session) ||
         !pending_filename(session->user_id, filename) ||
         !storage_lock_acquire(storage, STORAGE_AREA_ROOT,
                               ACCOUNT_DATABASE_LOCK, &database_lock) ||
@@ -305,6 +361,7 @@ int account_unlock(const struct storage *storage,
     struct crypto_keys keys = {0};
     unsigned char root[CRYPTO_KEY_BYTES] = {0};
     unsigned char vmk[AUTH_VMK_BYTES] = {0};
+    unsigned char authenticator[ACCOUNT_SESSION_AUTHENTICATOR_BYTES] = {0};
     int success = 0;
 
     if (session == NULL) {
@@ -348,13 +405,20 @@ int account_unlock(const struct storage *storage,
         goto cleanup;
     }
     OPENSSL_cleanse(keys.kek, sizeof(keys.kek));
+    if (!create_session_authenticator(record->user_id, vmk,
+                                      authenticator)) {
+        goto cleanup;
+    }
     memcpy(session->user_id, record->user_id, sizeof(session->user_id));
     memcpy(session->vmk, vmk, sizeof(session->vmk));
+    memcpy(session->authenticator, authenticator,
+           sizeof(session->authenticator));
     session->unlocked = 1;
     success = 1;
 
 cleanup:
     OPENSSL_cleanse(vmk, sizeof(vmk));
+    OPENSSL_cleanse(authenticator, sizeof(authenticator));
     OPENSSL_cleanse(&keys, sizeof(keys));
     OPENSSL_cleanse(root, sizeof(root));
     return success;

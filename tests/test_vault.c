@@ -17,6 +17,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <openssl/crypto.h>
 
 #define TEST_PATH_BYTES 4096
 #define TEST_FILENAME_BYTES 39
@@ -102,19 +103,6 @@ static int remove_tree(const char *path)
         success = 0;
     }
     return success;
-}
-
-static void make_session(struct account_session *session,
-                         unsigned char id_seed, unsigned char key_seed)
-{
-    memset(session, 0, sizeof(*session));
-    session->unlocked = 1;
-    for (size_t index = 0; index < sizeof(session->user_id); ++index) {
-        session->user_id[index] = (unsigned char)(id_seed + index);
-    }
-    for (size_t index = 0; index < sizeof(session->vmk); ++index) {
-        session->vmk[index] = (unsigned char)(key_seed + index);
-    }
 }
 
 static void make_filename(const unsigned char user_id[USER_DB_USER_ID_BYTES],
@@ -303,17 +291,23 @@ static void test_locked_and_missing(const struct storage *storage,
 {
     static const unsigned char payload[] = "dummy";
     struct account_session locked = *session;
-    struct account_session missing;
+    struct account_session fabricated;
     unsigned char *plaintext = (unsigned char *)1;
     size_t plaintext_length = 123;
 
     locked.unlocked = 0;
-    make_session(&missing, 0x60, 0x90);
+    memset(&fabricated, 0xa5, sizeof(fabricated));
+    fabricated.unlocked = 1;
     CHECK(vault_write(storage, &locked, payload, sizeof(payload) - 1) == 0);
     CHECK(vault_read(storage, &locked, &plaintext,
                      &plaintext_length) == VAULT_READ_ERROR);
     CHECK(plaintext == NULL && plaintext_length == 0);
-    CHECK(vault_read(storage, &missing, &plaintext,
+    CHECK(vault_read(storage, &fabricated, &plaintext,
+                     &plaintext_length) == VAULT_READ_ERROR);
+    CHECK(plaintext == NULL && plaintext_length == 0);
+    CHECK(vault_write(storage, &fabricated,
+                      payload, sizeof(payload) - 1) == 0);
+    CHECK(vault_read(storage, session, &plaintext,
                      &plaintext_length) == VAULT_READ_MISSING);
     CHECK(plaintext == NULL && plaintext_length == 0);
     CHECK(vault_write(storage, session, NULL, 1) == 0);
@@ -363,8 +357,6 @@ static void test_file_format_and_replacement(
         "recognizable dummy plaintext inside the encrypted vault";
     static const unsigned char replacement[] =
         "replacement encrypted vault payload";
-    static const char expected_filename[] =
-        "000102030405060708090a0b0c0d0e0f.vault";
     unsigned char first_nonce[CRYPTO_GCM_NONCE_BYTES];
     unsigned char *first_file = NULL;
     size_t first_file_length = 0;
@@ -373,7 +365,8 @@ static void test_file_format_and_replacement(
     char filename[TEST_FILENAME_BYTES];
 
     make_filename(session->user_id, filename);
-    CHECK(strcmp(filename, expected_filename) == 0);
+    CHECK(strlen(filename) == 38);
+    CHECK(strcmp(filename + 32, ".vault") == 0);
     CHECK(storage_read_file(storage, STORAGE_AREA_VAULTS, filename,
                             STORAGE_MAX_FILE_BYTES,
                             &first_file, &first_file_length) == STORAGE_READ_OK);
@@ -425,19 +418,18 @@ static void test_committed_write_reconciliation(
     check_round_trip(storage, session, payload, sizeof(payload) - 1);
 }
 
-static void test_empty_vault(const struct storage *storage)
+static void test_empty_vault(const struct storage *storage,
+                             const struct account_session *session)
 {
-    struct account_session empty_session;
     unsigned char *plaintext = NULL;
     unsigned char *serialized = NULL;
     size_t plaintext_length = 99;
     size_t serialized_length = 0;
     char filename[TEST_FILENAME_BYTES];
 
-    make_session(&empty_session, 0x20, 0x40);
-    make_filename(empty_session.user_id, filename);
-    CHECK(vault_write(storage, &empty_session, NULL, 0) == 1);
-    CHECK(vault_read(storage, &empty_session, &plaintext,
+    make_filename(session->user_id, filename);
+    CHECK(vault_write(storage, session, NULL, 0) == 1);
+    CHECK(vault_read(storage, session, &plaintext,
                      &plaintext_length) == VAULT_READ_OK);
     CHECK(plaintext != NULL && plaintext_length == 0);
     vault_secure_free(plaintext, plaintext_length);
@@ -569,7 +561,8 @@ int main(void)
     char home_template[TEST_PATH_BYTES];
     char *home = make_temporary_home(home_template);
     struct storage storage = STORAGE_INITIALIZER;
-    struct account_session session;
+    struct account_session session = ACCOUNT_SESSION_INITIALIZER;
+    char password[] = "dummy-vault-master-password";
     unsigned char *valid_file = NULL;
     size_t valid_file_length = 0;
     int home_set;
@@ -585,16 +578,22 @@ int main(void)
         return 1;
     }
     CHECK(storage_init(&storage) == 1);
-    make_session(&session, 0x00, 0x80);
+    CHECK(account_register(&storage, "VaultUser", 9,
+                           password, sizeof(password) - 1) ==
+          ACCOUNT_REGISTER_CREATED);
+    CHECK(account_unlock(&storage, "VaultUser", 9,
+                         password, sizeof(password) - 1, &session) == 1);
+    CHECK(account_session_is_valid(&session) == 1);
 
     if (storage.root_fd >= 0 && storage.vaults_fd >= 0) {
         test_locked_and_missing(&storage, &session);
         test_write_read_and_reopen(&storage, &session);
+        CHECK(account_registration_complete(&storage, &session) == 1);
         test_file_format_and_replacement(&storage, &session,
                                          &valid_file, &valid_file_length);
         test_committed_write_reconciliation(&storage, &session);
         test_concurrent_updates(&storage, &session);
-        test_empty_vault(&storage);
+        test_empty_vault(&storage, &session);
         if (valid_file != NULL) {
             test_wrong_session_and_authenticated_header(
                 &storage, &session, valid_file, valid_file_length);
@@ -604,6 +603,7 @@ int main(void)
     }
     storage_free(valid_file);
     account_session_lock(&session);
+    OPENSSL_cleanse(password, sizeof(password));
     vault_secure_free(NULL, 0);
     storage_close(&storage);
     CHECK(remove_tree(home));

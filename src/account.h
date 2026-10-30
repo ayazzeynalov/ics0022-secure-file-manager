@@ -8,6 +8,7 @@
 #include <stddef.h>
 
 #define ACCOUNT_MASTER_PASSWORD_MIN_BYTES 12
+#define ACCOUNT_SESSION_AUTHENTICATOR_BYTES 32
 #define ACCOUNT_REGISTER_ERROR 0
 #define ACCOUNT_REGISTER_CREATED 1
 #define ACCOUNT_REGISTER_RECOVERY 2
@@ -16,9 +17,10 @@ struct account_session {
     int unlocked;
     unsigned char user_id[USER_DB_USER_ID_BYTES];
     unsigned char vmk[AUTH_VMK_BYTES];
+    unsigned char authenticator[ACCOUNT_SESSION_AUTHENTICATOR_BYTES];
 };
 
-#define ACCOUNT_SESSION_INITIALIZER {0, {0}, {0}}
+#define ACCOUNT_SESSION_INITIALIZER {0, {0}, {0}, {0}}
 
 /* Registration returns CREATED for new metadata or RECOVERY when a matching
  * interrupted registration can resume. New passwords must contain at least
@@ -41,5 +43,10 @@ int account_unlock(const struct storage *storage,
                    struct account_session *session);
 
 void account_session_lock(struct account_session *session);
+
+/* A valid session is a bearer capability issued by account_unlock() in this
+ * process. This prevents a caller from authorizing vault access by setting an
+ * exposed flag in an otherwise fabricated structure. */
+int account_session_is_valid(const struct account_session *session);
 
 #endif
