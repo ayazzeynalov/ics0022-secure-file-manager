@@ -58,7 +58,7 @@ build/test_auth: build/test_auth.o build/auth.o build/crypto.o | check-openssl
 build/test_storage.o: tests/test_storage.c | build check-openssl
 	$(CC) $(CPPFLAGS) -Isrc $(OPENSSL_CFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
 
-build/test_storage: build/test_storage.o build/storage.o | check-openssl
+build/test_storage: build/test_storage.o build/storage_test.o | check-openssl
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
 build/test_audit.o: tests/test_audit.c | build check-openssl

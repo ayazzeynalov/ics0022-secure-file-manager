@@ -75,6 +75,27 @@ label, username, and notes, but keeps the password hidden unless the user types
 displays passwords. Passwords are never accepted as command-line arguments. Run
 `./securepm --help` for the command summary.
 
+The interactive process handles `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`, and
+`SIGTSTP` by notifying the normal input path and then performing ordinary
+session, vault-lock, secret-buffer, and terminal cleanup. In particular,
+Ctrl+Z terminates the session instead of suspending an unlocked vault. Terminal
+software flow control is disabled while the application is running so that
+Ctrl+S cannot leave output apparently frozen, and the original terminal state
+is restored at exit. Password echo is restored on recoverable secret-input exit
+paths. Reveal and deletion confirmations discard input that was already queued
+before the confirmation prompt, so a pasted sequence cannot supply its own
+future `yes` response.
+
+An authenticated session retains a decrypted credential collection in memory,
+but it does not treat that cached copy as permission to reconstruct a missing
+or externally changed vault. Before displaying or modifying credentials, the
+CLI verifies that the pathname-bound vault lock is still current and that the
+authenticated vault plaintext matches the in-memory collection. Updates use an
+exact compare-before-replace operation on the encrypted file. A missing,
+corrupted, replaced, permission-changed, or concurrently updated vault locks the
+session or makes the requested update fail; it is never silently replaced with
+the cached snapshot.
+
 ## Per-user access control
 
 Application accounts are isolated by authentication, session state, separate
@@ -161,7 +182,11 @@ of ordinary partial-write errors.
 - **Filesystem storage:** `~/.securepm/` and its `vaults/` directory use mode
   `0700`; files use mode `0600`. Storage uses directory file descriptors,
   `openat()`, `O_NOFOLLOW`, ownership and hard-link checks, exclusive temporary
-  files, checked writes, synchronization, and atomic replacement.
+  files, checked writes, synchronization, and atomic replacement. On macOS,
+  storage also rejects private directories and files carrying an extended ACL,
+  because an ACL can grant access that is not represented by the ordinary mode
+  bits. Linux retains the mode/ownership checks and does not depend on macOS ACL
+  APIs.
 - **Input validation:** terminal input is bounded and rejects oversized input
   and embedded NUL bytes. Binary formats validate lengths, counts, versions,
   integer conversions, truncation, trailing data, and maximum sizes before
@@ -174,7 +199,12 @@ of ordinary partial-write errors.
   cleanup functions when released.
 - **Concurrent access:** stable `0600` lock files serialize user registration
   and each vault's complete read-modify-write session. Data files continue to
-  use atomic replacement.
+  use atomic replacement. Storage retains descriptors for `HOME`, the private
+  root, and the vault directory and verifies that their current pathnames still
+  identify the same directories. After acquiring or before relying on a lock,
+  the lock descriptor must still identify the file at the expected pathname.
+  Atomic replacement also verifies that the destination has not changed while
+  the temporary file is written.
 - **Audit/error handling:** fixed-enum JSON Lines events contain no identifiers
   or sensitive fields. Audit append failures produce a generic warning without
   changing the primary operation, while authentication and vault-load failures
@@ -207,6 +237,11 @@ sudo apt update
 sudo apt install build-essential pkg-config libssl-dev
 ```
 
+On Windows, use an Ubuntu distribution under WSL2 and run the Debian/Ubuntu
+commands above inside that environment. Native Win32 builds are not supported;
+the application depends on POSIX terminals, signals, pseudo-terminals, file
+descriptors, permissions, and locking.
+
 Build, check the help text, run interactively, and run the tests from the
 repository root:
 
@@ -227,8 +262,10 @@ make OPENSSL_CFLAGS='-I/opt/openssl/include' \
      OPENSSL_LIBS='-L/opt/openssl/lib -lcrypto'
 ```
 
-The application and full test suite pass on macOS and Ubuntu 24.04.5 ARM64.
-The Linux run used GCC 13.3.0 and OpenSSL 3.0.13.
+The application and full test suite were previously validated on Ubuntu 24.04.5
+ARM64 with GCC 13.3.0 and OpenSSL 3.0.13. The current hardening changes must be
+revalidated in the target Linux or WSL2 environment before claiming a current
+Linux result.
 
 ## Tests
 
@@ -245,8 +282,9 @@ The Linux run used GCC 13.3.0 and OpenSSL 3.0.13.
 - user database, account, vault, and credential serialization tests; and
 - pseudo-terminal integration tests for registration, hidden input, login,
   credential retrieval, update and deletion, malformed vault handling, bounded
-  input, terminal restoration, audit event coverage, log injection resistance,
-  and audit-write failure handling.
+  input, real terminal-generated signals, flow-control behavior, terminal
+  restoration, queued confirmation input, failed credential persistence, audit
+  event coverage, log injection resistance, and audit-write failure handling.
 
 Filesystem tests use isolated temporary `HOME` directories and dummy secrets.
 The test suite covers authentication failures, malformed and truncated files,
@@ -278,3 +316,22 @@ Sensitive buffers are cleared when released, but memory is not locked against
 swapping and cannot be protected from a privileged process. The encrypted
 vault format authenticates its contents but does not prevent deletion or
 rollback to an older valid vault.
+
+`SIGKILL` and `SIGSTOP` cannot be caught, so the process cannot guarantee
+terminal restoration, explicit memory clearing, or lock-release cleanup after
+those signals. The operating system releases process-owned descriptors and
+advisory locks when a killed process exits, but `SIGSTOP` can leave an unlocked
+session and its lock suspended until the process is continued or terminated.
+The terminal hardening also cannot prevent privileged memory inspection,
+swapping, crash-dump copies, or copies introduced by the compiler or runtime.
+
+The pathname and compare-before-replace checks reduce accidental and
+cooperative-process lost updates, but they cannot create an operating-system
+security boundary against a malicious process running as the same OS user.
+Such a process can continuously race pathname checks, replace files immediately
+after validation, or stop the password manager between validation and rename.
+Preventing that class of attack requires a stronger OS privilege boundary or a
+trusted external storage service. Removing `users.db` does not revoke an
+already-issued in-process session capability; the current session can continue
+only while its vault and lock remain valid, and new logins fail closed until the
+database is safely restored.

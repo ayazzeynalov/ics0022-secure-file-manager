@@ -17,13 +17,33 @@
 int vault_lock_acquire(const struct storage *storage,
                        const struct account_session *session,
                        struct storage_lock *lock);
+int vault_lock_validate(const struct storage *storage,
+                        const struct account_session *session,
+                        const struct storage_lock *lock);
 
-/* Writes require an authenticated, unlocked session capability. NULL plaintext
- * is accepted only for an explicitly encrypted empty payload. The file is
- * replaced atomically. */
+/* Unconditional writes require an authenticated, unlocked session capability
+ * and are intended for initial vault creation and explicit recovery paths.
+ * Updates to a vault loaded earlier must use vault_replace_if_current(). NULL
+ * plaintext is accepted only for an explicitly encrypted empty payload. */
 int vault_write(const struct storage *storage,
                 const struct account_session *session,
                 const unsigned char *plaintext, size_t plaintext_length);
+
+/* Verifies that the pathname-bound lock is still current and that the
+ * authenticated vault still contains the expected plaintext. Replacement is
+ * refused if another process deleted, replaced, or changed either object. */
+int vault_verify_current(const struct storage *storage,
+                         const struct account_session *session,
+                         const struct storage_lock *lock,
+                         const unsigned char *expected,
+                         size_t expected_length);
+int vault_replace_if_current(const struct storage *storage,
+                             const struct account_session *session,
+                             const struct storage_lock *lock,
+                             const unsigned char *expected,
+                             size_t expected_length,
+                             const unsigned char *plaintext,
+                             size_t plaintext_length);
 
 /* Missing vaults are distinct from malformed/authentication failures. Returned
  * plaintext must be released with vault_secure_free() and its returned length. */

@@ -507,6 +507,616 @@ static void test_eof_at_secret(const char *program, const char *home)
     close(master);
 }
 
+static void test_signal_at_prompt(
+    const char *program, const char *home,
+    const struct dialog_step *steps, size_t step_count,
+    int signal_number, unsigned char terminal_character,
+    const unsigned char *partial, size_t partial_length,
+    const unsigned char *forbidden, size_t forbidden_length)
+{
+    struct transcript transcript = {{0}, 0, 0};
+    struct termios terminal;
+    int master = -1;
+    int status = 0;
+    pid_t child = start_program(program, home, &master);
+    int success = child > 0;
+
+    CHECK(success);
+    if (!success) {
+        return;
+    }
+    for (size_t index = 0; index < step_count && success; ++index) {
+        success = wait_for_text(master, &transcript, steps[index].expected);
+        if (success && steps[index].response != NULL) {
+            success = write_all(master, steps[index].response);
+        }
+    }
+    CHECK(success);
+    if (success && partial_length != 0) {
+        success = write_bytes(master, partial, partial_length);
+        CHECK(success);
+    }
+    if (success) {
+        success = terminal_character != 0 ?
+                      write_bytes(master, &terminal_character, 1) :
+                      kill(child, signal_number) == 0;
+        CHECK(success);
+    }
+    if (success) {
+        success = wait_for_exit(child, master, &status);
+        CHECK(success);
+    }
+    if (success) {
+        CHECK(WIFEXITED(status) &&
+              WEXITSTATUS(status) == 128 + signal_number);
+        CHECK(tcgetattr(master, &terminal) == 0);
+        CHECK((terminal.c_lflag & ECHO) != 0);
+        CHECK((terminal.c_iflag & IXON) != 0);
+        if (forbidden_length != 0) {
+            CHECK(!contains_bytes(transcript.data, transcript.length,
+                                  forbidden, forbidden_length));
+        }
+    } else {
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, &status, 0);
+    }
+    close(master);
+}
+
+static void test_eof_at_username(const char *program, const char *home)
+{
+    struct transcript transcript = {{0}, 0, 0};
+    struct termios terminal;
+    int master = -1;
+    int status = 0;
+    pid_t child = start_program(program, home, &master);
+
+    CHECK(child > 0);
+    if (child <= 0) {
+        return;
+    }
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(write_all(master, "2\n"));
+    CHECK(wait_for_text(master, &transcript, "Username: "));
+    CHECK(write(master, "\004", 1) == 1);
+    CHECK(wait_for_exit(child, master, &status));
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(tcgetattr(master, &terminal) == 0);
+    CHECK((terminal.c_lflag & ECHO) != 0);
+    CHECK((terminal.c_iflag & IXON) != 0);
+    close(master);
+}
+
+static void test_terminal_controls(const char *program, const char *home)
+{
+    static const unsigned char flow_controls[] = {0x13, 0x11, '9', '9', '\n'};
+    unsigned char edited_username[] = {
+        'A', 'l', 'i', 'c', 'x', 0, 'e', '\n'
+    };
+    unsigned char edited_password[] = {
+        'w', 'r', 'o', 'n', 'g', 0,
+        'd', 'u', 'm', 'm', 'y', '-', 'm', 'a', 's', 't', 'e', 'r', '-',
+        'p', 'a', 's', 's', 'w', 'o', 'r', 'd', '-', '4', '2', '\n'
+    };
+    struct transcript transcript = {{0}, 0, 0};
+    struct termios terminal;
+    int master = -1;
+    int status = 0;
+    pid_t child = start_program(program, home, &master);
+
+    CHECK(child > 0);
+    if (child <= 0) {
+        return;
+    }
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(tcgetattr(master, &terminal) == 0);
+    CHECK((terminal.c_iflag & IXON) == 0);
+    edited_username[5] = terminal.c_cc[VERASE];
+    edited_password[5] = terminal.c_cc[VKILL];
+    CHECK(write_bytes(master, flow_controls, sizeof(flow_controls)));
+    CHECK(wait_for_text(master, &transcript, "Invalid choice."));
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(write_all(master, "2\n"));
+    CHECK(wait_for_text(master, &transcript, "Username: "));
+    CHECK(write_bytes(master, edited_username, sizeof(edited_username)));
+    CHECK(wait_for_text(master, &transcript, "Master password: "));
+    CHECK(write_bytes(master, edited_password, sizeof(edited_password)));
+    CHECK(wait_for_text(master, &transcript, "Login successful."));
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(write_all(master, "7\n"));
+    CHECK(wait_for_exit(child, master, &status));
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(tcgetattr(master, &terminal) == 0);
+    CHECK((terminal.c_lflag & ECHO) != 0);
+    CHECK((terminal.c_iflag & IXON) != 0);
+    CHECK(!contains_bytes(transcript.data, transcript.length,
+                          (const unsigned char *)"dummy-master-password-42",
+                          sizeof("dummy-master-password-42") - 1));
+    close(master);
+}
+
+static void test_terminal_signals(const char *program, const char *home,
+                                  const char *record_id)
+{
+    static const unsigned char partial_master[] = "partial-dummy-master";
+    static const unsigned char partial_credential[] = "partial-dummy-credential";
+    static const struct dialog_step main_prompt[] = {
+        {"Choice: ", NULL}
+    };
+    static const struct dialog_step username_prompt[] = {
+        {"Choice: ", "2\n"},
+        {"Username: ", NULL}
+    };
+    static const struct dialog_step master_prompt[] = {
+        {"Choice: ", "2\n"},
+        {"Username: ", "Alice\n"},
+        {"Master password: ", NULL}
+    };
+    static const struct dialog_step confirmation_prompt[] = {
+        {"Choice: ", "1\n"},
+        {"Username: ", "InterruptedRegistration\n"},
+        {"Master password: ", "dummy-registration-password\n"},
+        {"Confirm master password: ", NULL}
+    };
+    static const struct dialog_step login_success[] = {
+        {"Choice: ", "2\n"},
+        {"Username: ", "Alice\n"},
+        {"Master password: ", "dummy-master-password-42\n"},
+        {"Login successful.", NULL}
+    };
+    static const struct dialog_step vault_prompt[] = {
+        {"Choice: ", "2\n"},
+        {"Username: ", "Alice\n"},
+        {"Master password: ", "dummy-master-password-42\n"},
+        {"Login successful.", NULL},
+        {"Choice: ", NULL}
+    };
+    static const struct dialog_step credential_password_prompt[] = {
+        {"Choice: ", "2\n"},
+        {"Username: ", "Alice\n"},
+        {"Master password: ", "dummy-master-password-42\n"},
+        {"Login successful.", NULL},
+        {"Choice: ", "1\n"},
+        {"Label: ", "interrupted-add\n"},
+        {"Credential username: ", "dummy\n"},
+        {"Credential password: ", NULL}
+    };
+    static const struct dialog_step notes_prompt[] = {
+        {"Choice: ", "2\n"},
+        {"Username: ", "Alice\n"},
+        {"Master password: ", "dummy-master-password-42\n"},
+        {"Login successful.", NULL},
+        {"Choice: ", "1\n"},
+        {"Label: ", "interrupted-before-save\n"},
+        {"Credential username: ", "dummy\n"},
+        {"Credential password: ", "dummy-never-saved-secret\n"},
+        {"Notes (optional): ", NULL}
+    };
+    struct dialog_step reveal_prompt[] = {
+        {"Choice: ", "2\n"},
+        {"Username: ", "Alice\n"},
+        {"Master password: ", "dummy-master-password-42\n"},
+        {"Login successful.", NULL},
+        {"Choice: ", "3\n"},
+        {"Record ID: ", record_id},
+        {"Type yes to reveal password: ", NULL}
+    };
+    struct dialog_step delete_prompt[] = {
+        {"Choice: ", "2\n"},
+        {"Username: ", "Alice\n"},
+        {"Master password: ", "dummy-master-password-42\n"},
+        {"Login successful.", NULL},
+        {"Choice: ", "5\n"},
+        {"Record ID: ", record_id},
+        {"Type yes to confirm deletion: ", NULL}
+    };
+    static const struct dialog_step verify_restart[] = {
+        {"Choice: ", "2\n"},
+        {"Username: ", "Alice\n"},
+        {"Master password: ", "dummy-master-password-42\n"},
+        {"Login successful.", NULL},
+        {"Choice: ", "2\n"},
+        {"Label: Example\"},{\"event\":\"forged | Username: dummy-user", NULL},
+        {"Choice: ", "7\n"}
+    };
+    char vault_path[TEST_PATH_BYTES];
+    unsigned char *before = NULL;
+    unsigned char *after = NULL;
+    size_t before_length = 0;
+    size_t after_length = 0;
+    struct transcript transcript;
+
+    CHECK(find_vault(home, vault_path));
+    before = read_file(vault_path, &before_length);
+    CHECK(before != NULL && before_length != 0);
+
+    test_signal_at_prompt(program, home, main_prompt, 1, SIGINT, 0x03,
+                          NULL, 0, NULL, 0);
+    test_signal_at_prompt(program, home, username_prompt, 2, SIGTSTP, 0x1a,
+                          NULL, 0, NULL, 0);
+    test_signal_at_prompt(program, home, master_prompt, 3, SIGQUIT, 0x1c,
+                          partial_master, sizeof(partial_master) - 1,
+                          partial_master, sizeof(partial_master) - 1);
+    test_signal_at_prompt(program, home, confirmation_prompt, 4, SIGTERM, 0,
+                          NULL, 0, NULL, 0);
+    test_signal_at_prompt(program, home, main_prompt, 1, SIGHUP, 0,
+                          NULL, 0, NULL, 0);
+    test_signal_at_prompt(program, home, login_success, 4, SIGTERM, 0,
+                          NULL, 0, NULL, 0);
+    test_signal_at_prompt(program, home, vault_prompt, 5, SIGTSTP, 0x1a,
+                          NULL, 0, NULL, 0);
+    test_signal_at_prompt(program, home, credential_password_prompt, 8,
+                          SIGINT, 0x03,
+                          partial_credential, sizeof(partial_credential) - 1,
+                          partial_credential, sizeof(partial_credential) - 1);
+    test_signal_at_prompt(program, home, notes_prompt, 9, SIGTERM, 0,
+                          NULL, 0,
+                          (const unsigned char *)"dummy-never-saved-secret",
+                          sizeof("dummy-never-saved-secret") - 1);
+    test_signal_at_prompt(program, home, reveal_prompt, 7, SIGQUIT, 0x1c,
+                          NULL, 0,
+                          (const unsigned char *)"dummy-credential-secret-73",
+                          sizeof("dummy-credential-secret-73") - 1);
+    test_signal_at_prompt(program, home, delete_prompt, 7, SIGTSTP, 0x1a,
+                          NULL, 0, NULL, 0);
+    after = read_file(vault_path, &after_length);
+    CHECK(after != NULL && after_length == before_length);
+    if (before != NULL && after != NULL && after_length == before_length) {
+        CHECK(memcmp(before, after, before_length) == 0);
+    }
+    free(before);
+    free(after);
+    CHECK(run_dialog(program, home, verify_restart,
+                     sizeof(verify_restart) / sizeof(verify_restart[0]),
+                     &transcript));
+}
+
+static void test_invalid_menu_controls(const char *program, const char *home)
+{
+    static const unsigned char responses[][24] = {
+        "0\n", "8\n", "9\n", "99\n", "-1\n", "abc\n", "exit\n",
+        "help\n", "\n", " \t\n", "12345678901234567890\n",
+        "\033[A\n", "\014\n", "\022\n", "\026x\n"
+    };
+    struct transcript transcript = {{0}, 0, 0};
+    int master = -1;
+    int status = 0;
+    pid_t child = start_program(program, home, &master);
+
+    CHECK(child > 0);
+    if (child <= 0) {
+        return;
+    }
+    for (size_t index = 0;
+         index < sizeof(responses) / sizeof(responses[0]); ++index) {
+        CHECK(wait_for_text(master, &transcript, "Choice: "));
+        CHECK(write_bytes(master, responses[index],
+                          strlen((const char *)responses[index])));
+        if (index == 10) {
+            CHECK(wait_for_text(master, &transcript, "Input too long."));
+        } else {
+            CHECK(wait_for_text(master, &transcript, "Invalid choice."));
+        }
+    }
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(write_all(master, "3\n"));
+    CHECK(wait_for_exit(child, master, &status));
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(master);
+}
+
+static void test_queued_confirmations(const char *program, const char *home,
+                                      const char *record_id)
+{
+    struct transcript transcript = {{0}, 0, 0};
+    char paste[96];
+    int master = -1;
+    int status = 0;
+    int length;
+    pid_t child = start_program(program, home, &master);
+
+    CHECK(child > 0);
+    if (child <= 0) {
+        return;
+    }
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(write_all(master, "2\n"));
+    CHECK(wait_for_text(master, &transcript, "Username: "));
+    CHECK(write_all(master, "Alice\n"));
+    CHECK(wait_for_text(master, &transcript, "Master password: "));
+    CHECK(write_all(master, "dummy-master-password-42\n"));
+    CHECK(wait_for_text(master, &transcript, "Login successful."));
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+
+    length = snprintf(paste, sizeof(paste), "5\n%syes\n", record_id);
+    CHECK(length > 0 && (size_t)length < sizeof(paste));
+    CHECK(write_bytes(master, paste, (size_t)length));
+    CHECK(wait_for_text(master, &transcript,
+                        "Type yes to confirm deletion: "));
+    CHECK(write_all(master, "no\n"));
+    CHECK(wait_for_text(master, &transcript, "Deletion cancelled."));
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(write_all(master, "2\n"));
+    CHECK(wait_for_text(master, &transcript,
+                        "Label: Example\"},{\"event\":\"forged | "
+                        "Username: dummy-user"));
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+
+    length = snprintf(paste, sizeof(paste), "3\n%syes\n", record_id);
+    CHECK(length > 0 && (size_t)length < sizeof(paste));
+    CHECK(write_bytes(master, paste, (size_t)length));
+    CHECK(wait_for_text(master, &transcript,
+                        "Type yes to reveal password: "));
+    CHECK(write_all(master, "no\n"));
+    CHECK(wait_for_text(master, &transcript, "Password remains hidden."));
+    CHECK(!contains_bytes(transcript.data, transcript.length,
+                          (const unsigned char *)"dummy-credential-secret-73",
+                          sizeof("dummy-credential-secret-73") - 1));
+    CHECK(!contains_bytes(transcript.data, transcript.length,
+                          (const unsigned char *)"Credential deleted.",
+                          sizeof("Credential deleted.") - 1));
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(write_all(master, "7\n"));
+    CHECK(wait_for_exit(child, master, &status));
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(master);
+}
+
+static void test_crud_write_failures(const char *program, const char *home,
+                                     const char *record_id)
+{
+    struct transcript transcript = {{0}, 0, 0};
+    char root[TEST_PATH_BYTES];
+    char vaults[TEST_PATH_BYTES];
+    char vault_path[TEST_PATH_BYTES];
+    unsigned char *before = NULL;
+    unsigned char *after = NULL;
+    size_t before_length = 0;
+    size_t after_length = 0;
+    int master = -1;
+    int status = 0;
+    pid_t child;
+
+    CHECK(make_path(root, home, ".securepm"));
+    CHECK(make_path(vaults, root, "vaults"));
+    CHECK(find_vault(home, vault_path));
+    before = read_file(vault_path, &before_length);
+    CHECK(before != NULL && before_length != 0);
+    child = start_program(program, home, &master);
+    CHECK(child > 0);
+    if (child <= 0) {
+        free(before);
+        return;
+    }
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(write_all(master, "2\n"));
+    CHECK(wait_for_text(master, &transcript, "Username: "));
+    CHECK(write_all(master, "Alice\n"));
+    CHECK(wait_for_text(master, &transcript, "Master password: "));
+    CHECK(write_all(master, "dummy-master-password-42\n"));
+    CHECK(wait_for_text(master, &transcript, "Login successful."));
+
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(write_all(master, "1\n"));
+    CHECK(wait_for_text(master, &transcript, "Label: "));
+    CHECK(write_all(master, "failed-create\n"));
+    CHECK(wait_for_text(master, &transcript, "Credential username: "));
+    CHECK(write_all(master, "failed-user\n"));
+    CHECK(wait_for_text(master, &transcript, "Credential password: "));
+    CHECK(write_all(master, "failed-create-secret\n"));
+    CHECK(wait_for_text(master, &transcript, "Notes (optional): "));
+    CHECK(chmod(vaults, 0500) == 0);
+    CHECK(write_all(master, "not persisted\n"));
+    CHECK(wait_for_text(master, &transcript,
+                        "Credential could not be saved."));
+    CHECK(chmod(vaults, 0700) == 0);
+
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(write_all(master, "4\n"));
+    CHECK(wait_for_text(master, &transcript, "Record ID: "));
+    CHECK(write_all(master, record_id));
+    CHECK(wait_for_text(master, &transcript, "New label: "));
+    CHECK(write_all(master, "failed-update\n"));
+    CHECK(wait_for_text(master, &transcript, "New credential username: "));
+    CHECK(write_all(master, "failed-user\n"));
+    CHECK(wait_for_text(master, &transcript, "New credential password: "));
+    CHECK(write_all(master, "failed-update-secret\n"));
+    CHECK(wait_for_text(master, &transcript, "New notes (optional): "));
+    CHECK(chmod(vaults, 0500) == 0);
+    CHECK(write_all(master, "not persisted\n"));
+    CHECK(wait_for_text(master, &transcript,
+                        "Credential could not be updated."));
+    CHECK(chmod(vaults, 0700) == 0);
+
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(write_all(master, "5\n"));
+    CHECK(wait_for_text(master, &transcript, "Record ID: "));
+    CHECK(write_all(master, record_id));
+    CHECK(wait_for_text(master, &transcript,
+                        "Type yes to confirm deletion: "));
+    CHECK(chmod(vaults, 0500) == 0);
+    CHECK(write_all(master, "yes\n"));
+    CHECK(wait_for_text(master, &transcript,
+                        "Credential could not be deleted."));
+    CHECK(chmod(vaults, 0700) == 0);
+
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(write_all(master, "2\n"));
+    CHECK(wait_for_text(master, &transcript,
+                        "Label: Example\"},{\"event\":\"forged | "
+                        "Username: dummy-user"));
+    CHECK(!contains_bytes(transcript.data, transcript.length,
+                          (const unsigned char *)"failed-create-secret",
+                          sizeof("failed-create-secret") - 1));
+    CHECK(!contains_bytes(transcript.data, transcript.length,
+                          (const unsigned char *)"failed-update-secret",
+                          sizeof("failed-update-secret") - 1));
+    CHECK(wait_for_text(master, &transcript, "Choice: "));
+    CHECK(write_all(master, "7\n"));
+    CHECK(wait_for_exit(child, master, &status));
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(master);
+
+    after = read_file(vault_path, &after_length);
+    CHECK(after != NULL && after_length == before_length);
+    if (before != NULL && after != NULL && after_length == before_length) {
+        CHECK(memcmp(before, after, before_length) == 0);
+    }
+    free(before);
+    free(after);
+}
+
+static void test_deleted_vault_during_session(
+    const char *program, const char *home, const char *vault_path,
+    const char *record_id)
+{
+    static const char *const failures_by_operation[] = {
+        "Credential could not be saved.",
+        "Credential could not be updated.",
+        "Credential could not be deleted."
+    };
+    char backup_path[TEST_PATH_BYTES];
+    unsigned char *original = NULL;
+    unsigned char *after = NULL;
+    size_t original_length = 0;
+    size_t after_length = 0;
+    int backup_length = snprintf(backup_path, sizeof(backup_path),
+                                 "%s.external-backup", vault_path);
+
+    CHECK(backup_length > 0 && (size_t)backup_length < sizeof(backup_path));
+    original = read_file(vault_path, &original_length);
+    CHECK(original != NULL && original_length != 0);
+    if (original == NULL || backup_length <= 0 ||
+        (size_t)backup_length >= sizeof(backup_path)) {
+        free(original);
+        return;
+    }
+
+    {
+        struct transcript transcript = {{0}, 0, 0};
+        int master = -1;
+        int status = 0;
+        pid_t child = start_program(program, home, &master);
+
+        CHECK(child > 0);
+        CHECK(wait_for_text(master, &transcript, "Choice: "));
+        CHECK(write_all(master, "2\n"));
+        CHECK(wait_for_text(master, &transcript, "Username: "));
+        CHECK(write_all(master, "Alice\n"));
+        CHECK(wait_for_text(master, &transcript, "Master password: "));
+        CHECK(write_all(master, "dummy-master-password-42\n"));
+        CHECK(wait_for_text(master, &transcript, "Login successful."));
+        CHECK(rename(vault_path, backup_path) == 0);
+        CHECK(wait_for_text(master, &transcript, "Choice: "));
+        CHECK(write_all(master, "2\n"));
+        CHECK(wait_for_text(master, &transcript,
+                            "Vault is unavailable. Session locked."));
+        CHECK(wait_for_text(master, &transcript, "Choice: "));
+        CHECK(write_all(master, "3\n"));
+        CHECK(wait_for_exit(child, master, &status));
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        CHECK(!contains_bytes(
+            transcript.data, transcript.length,
+            (const unsigned char *)"dummy-credential-secret-73",
+            sizeof("dummy-credential-secret-73") - 1));
+        close(master);
+        CHECK(rename(backup_path, vault_path) == 0);
+    }
+
+    for (size_t operation = 0; operation < 3; ++operation) {
+        struct transcript transcript = {{0}, 0, 0};
+        int master = -1;
+        int status = 0;
+        pid_t child = start_program(program, home, &master);
+
+        CHECK(child > 0);
+        CHECK(wait_for_text(master, &transcript, "Choice: "));
+        CHECK(write_all(master, "2\n"));
+        CHECK(wait_for_text(master, &transcript, "Username: "));
+        CHECK(write_all(master, "Alice\n"));
+        CHECK(wait_for_text(master, &transcript, "Master password: "));
+        CHECK(write_all(master, "dummy-master-password-42\n"));
+        CHECK(wait_for_text(master, &transcript, "Login successful."));
+        CHECK(wait_for_text(master, &transcript, "Choice: "));
+        if (operation == 0) {
+            CHECK(write_all(master, "1\n"));
+            CHECK(wait_for_text(master, &transcript, "Label: "));
+            CHECK(write_all(master, "external-create\n"));
+            CHECK(wait_for_text(master, &transcript,
+                                "Credential username: "));
+            CHECK(write_all(master, "external-user\n"));
+            CHECK(wait_for_text(master, &transcript,
+                                "Credential password: "));
+            CHECK(write_all(master, "external-create-secret\n"));
+            CHECK(wait_for_text(master, &transcript, "Notes (optional): "));
+        } else if (operation == 1) {
+            CHECK(write_all(master, "4\n"));
+            CHECK(wait_for_text(master, &transcript, "Record ID: "));
+            CHECK(write_all(master, record_id));
+            CHECK(wait_for_text(master, &transcript, "New label: "));
+            CHECK(write_all(master, "external-update\n"));
+            CHECK(wait_for_text(master, &transcript,
+                                "New credential username: "));
+            CHECK(write_all(master, "external-user\n"));
+            CHECK(wait_for_text(master, &transcript,
+                                "New credential password: "));
+            CHECK(write_all(master, "external-update-secret\n"));
+            CHECK(wait_for_text(master, &transcript,
+                                "New notes (optional): "));
+        } else {
+            CHECK(write_all(master, "5\n"));
+            CHECK(wait_for_text(master, &transcript, "Record ID: "));
+            CHECK(write_all(master, record_id));
+            CHECK(wait_for_text(master, &transcript,
+                                "Type yes to confirm deletion: "));
+        }
+        CHECK(rename(vault_path, backup_path) == 0);
+        CHECK(write_all(master, operation == 2 ? "yes\n" :
+                                              "not persisted\n"));
+        CHECK(wait_for_text(master, &transcript,
+                            failures_by_operation[operation]));
+        CHECK(wait_for_text(master, &transcript, "Choice: "));
+        CHECK(write_all(master, "7\n"));
+        CHECK(wait_for_exit(child, master, &status));
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        after = read_file(backup_path, &after_length);
+        CHECK(after != NULL && after_length == original_length);
+        if (after != NULL && after_length == original_length) {
+            CHECK(memcmp(after, original, original_length) == 0);
+        }
+        free(after);
+        after = NULL;
+        CHECK(rename(backup_path, vault_path) == 0);
+        CHECK(!contains_bytes(
+            transcript.data, transcript.length,
+            (const unsigned char *)"external-create-secret",
+            sizeof("external-create-secret") - 1));
+        CHECK(!contains_bytes(
+            transcript.data, transcript.length,
+            (const unsigned char *)"external-update-secret",
+            sizeof("external-update-secret") - 1));
+        close(master);
+    }
+    {
+        static const struct dialog_step restart_steps[] = {
+            {"Choice: ", "2\n"},
+            {"Username: ", "Alice\n"},
+            {"Master password: ", "dummy-master-password-42\n"},
+            {"Login successful.", NULL},
+            {"Choice: ", "2\n"},
+            {"Label: Example\"},{\"event\":\"forged | "
+             "Username: dummy-user", NULL},
+            {"Choice: ", "7\n"}
+        };
+        struct transcript transcript;
+
+        CHECK(run_dialog(program, home, restart_steps,
+                         sizeof(restart_steps) / sizeof(restart_steps[0]),
+                         &transcript));
+    }
+    free(original);
+}
+
 static void test_embedded_nul(const char *program, const char *home)
 {
     static const unsigned char invalid_username[] = {
@@ -695,6 +1305,10 @@ int main(int argc, char *argv[])
         {"Master password: ", "dummy-wrong-password\n"},
         {"Login failed.", NULL},
         {"Choice: ", "2\n"},
+        {"Username: ", "Bad Name\n"},
+        {"Master password: ", "dummy-wrong-password\n"},
+        {"Login failed.", NULL},
+        {"Choice: ", "2\n"},
         {"Username: ", "Alice\n"},
         {"Master password: ", "dummy-master-password-42\n"},
         {"Login successful.", NULL},
@@ -736,15 +1350,19 @@ int main(int argc, char *argv[])
     char home_template[TEST_PATH_BYTES];
     char vault_path[TEST_PATH_BYTES];
     char audit_path[TEST_PATH_BYTES];
+    char users_path[TEST_PATH_BYTES];
+    char users_backup_path[TEST_PATH_BYTES];
     char *home;
     struct transcript transcript;
     struct stat vault_status;
     unsigned char *vault_data = NULL;
     unsigned char *after_failure = NULL;
     unsigned char *audit_data = NULL;
+    unsigned char *users_data = NULL;
     size_t vault_length = 0;
     size_t after_failure_length = 0;
     size_t audit_length = 0;
+    size_t users_length = 0;
     char record_id[TEST_RECORD_ID_BYTES * 2 + 2] = {0};
     char bob_record_id[TEST_RECORD_ID_BYTES * 2 + 2] = {0};
     char oversized_label[131];
@@ -787,6 +1405,9 @@ int main(int argc, char *argv[])
     CHECK(stat(vault_path, &vault_status) == 0);
     CHECK(S_ISREG(vault_status.st_mode));
     CHECK((vault_status.st_mode & 07777) == 0600);
+    test_invalid_menu_controls(program, home);
+    test_eof_at_username(program, home);
+    test_terminal_controls(program, home);
 
     CHECK(clock_gettime(CLOCK_MONOTONIC, &throttle_start) == 0);
     CHECK(run_dialog(program, home, wrong_password_steps,
@@ -794,7 +1415,7 @@ int main(int argc, char *argv[])
                          sizeof(wrong_password_steps[0]),
                      &transcript));
     CHECK(clock_gettime(CLOCK_MONOTONIC, &throttle_end) == 0);
-    CHECK(elapsed_milliseconds(&throttle_start, &throttle_end) >= 1400);
+    CHECK(elapsed_milliseconds(&throttle_start, &throttle_end) >= 3400);
     CHECK(!contains_bytes(transcript.data, transcript.length,
                           (const unsigned char *)wrong_password,
                           sizeof(wrong_password) - 1));
@@ -838,6 +1459,13 @@ int main(int argc, char *argv[])
                           (const unsigned char *)credential_password,
                           sizeof(credential_password) - 1));
     CHECK(extract_record_id(&transcript, record_id));
+    if (record_id[0] != '\0') {
+        test_terminal_signals(program, home, record_id);
+        test_queued_confirmations(program, home, record_id);
+        test_crud_write_failures(program, home, record_id);
+        test_deleted_vault_during_session(program, home, vault_path,
+                                          record_id);
+    }
 
     {
         static const struct dialog_step register_bob_steps[] = {
@@ -1144,6 +1772,54 @@ int main(int argc, char *argv[])
                          &transcript));
     }
     CHECK(chmod(audit_path, 0600) == 0);
+
+    CHECK(make_path(users_path, home, ".securepm/users.db"));
+    CHECK(make_path(users_backup_path, home, ".securepm/users.db.backup"));
+    users_data = read_file(users_path, &users_length);
+    CHECK(users_data != NULL && users_length != 0);
+    if (users_data != NULL && users_length != 0) {
+        static const struct dialog_step restored_login_steps[] = {
+            {"Choice: ", "2\n"},
+            {"Username: ", "Alice\n"},
+            {"Master password: ", "dummy-master-password-42\n"},
+            {"Login successful.", NULL},
+            {"Choice: ", "7\n"}
+        };
+
+        users_data[0] ^= 1;
+        CHECK(overwrite_file(users_path, users_data, users_length));
+        CHECK(clock_gettime(CLOCK_MONOTONIC, &throttle_start) == 0);
+        CHECK(run_dialog(program, home, failed_vault_steps,
+                         sizeof(failed_vault_steps) /
+                             sizeof(failed_vault_steps[0]),
+                         &transcript));
+        CHECK(clock_gettime(CLOCK_MONOTONIC, &throttle_end) == 0);
+        CHECK(elapsed_milliseconds(&throttle_start, &throttle_end) >= 450);
+        CHECK(!contains_bytes(transcript.data, transcript.length,
+                              (const unsigned char *)"users.db",
+                              sizeof("users.db") - 1));
+        CHECK(!contains_bytes(transcript.data, transcript.length,
+                              (const unsigned char *)"OpenSSL",
+                              sizeof("OpenSSL") - 1));
+        users_data[0] ^= 1;
+        CHECK(overwrite_file(users_path, users_data, users_length));
+
+        CHECK(rename(users_path, users_backup_path) == 0);
+        CHECK(clock_gettime(CLOCK_MONOTONIC, &throttle_start) == 0);
+        CHECK(run_dialog(program, home, failed_vault_steps,
+                         sizeof(failed_vault_steps) /
+                             sizeof(failed_vault_steps[0]),
+                         &transcript));
+        CHECK(clock_gettime(CLOCK_MONOTONIC, &throttle_end) == 0);
+        CHECK(elapsed_milliseconds(&throttle_start, &throttle_end) >= 450);
+        CHECK(lstat(users_path, &vault_status) != 0 && errno == ENOENT);
+        CHECK(rename(users_backup_path, users_path) == 0);
+        CHECK(run_dialog(program, home, restored_login_steps,
+                         sizeof(restored_login_steps) /
+                             sizeof(restored_login_steps[0]),
+                         &transcript));
+    }
+    free(users_data);
 
     vault_data = read_file(vault_path, &vault_length);
     CHECK(vault_data != NULL && vault_length != 0);

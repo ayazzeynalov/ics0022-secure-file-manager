@@ -27,6 +27,7 @@
 #define TEST_FIXED_BYTES 60
 
 void storage_test_fail_atomic_sync_after(unsigned int writes);
+void storage_test_fail_atomic_precommit_once(void);
 
 static unsigned int checks;
 static unsigned int failures;
@@ -412,10 +413,70 @@ static void test_committed_write_reconciliation(
     const struct account_session *session)
 {
     static const unsigned char payload[] = "committed after sync failure";
+    static const unsigned char replacement[] =
+        "conditional replacement after sync failure";
+    struct storage_lock lock = STORAGE_LOCK_INITIALIZER;
 
     storage_test_fail_atomic_sync_after(1);
     CHECK(vault_write(storage, session, payload, sizeof(payload) - 1) == 1);
     check_round_trip(storage, session, payload, sizeof(payload) - 1);
+    CHECK(vault_lock_acquire(storage, session, &lock) == 1);
+    storage_test_fail_atomic_sync_after(1);
+    CHECK(vault_replace_if_current(
+              storage, session, &lock,
+              payload, sizeof(payload) - 1,
+              replacement, sizeof(replacement) - 1) == 1);
+    storage_lock_release(&lock);
+    check_round_trip(storage, session,
+                     replacement, sizeof(replacement) - 1);
+}
+
+static void test_precommit_failure_is_not_reconciled(
+    const struct storage *storage,
+    const struct account_session *session)
+{
+    static const unsigned char payload[] = "unchanged plaintext";
+    struct storage_lock lock = STORAGE_LOCK_INITIALIZER;
+    unsigned char *before = NULL;
+    unsigned char *after = NULL;
+    size_t before_length = 0;
+    size_t after_length = 0;
+    char filename[TEST_FILENAME_BYTES];
+
+    make_filename(session->user_id, filename);
+    CHECK(vault_write(storage, session, payload, sizeof(payload) - 1) == 1);
+    CHECK(storage_read_file(storage, STORAGE_AREA_VAULTS, filename,
+                            STORAGE_MAX_FILE_BYTES,
+                            &before, &before_length) == STORAGE_READ_OK);
+
+    storage_test_fail_atomic_precommit_once();
+    CHECK(vault_write(storage, session, payload, sizeof(payload) - 1) == 0);
+    CHECK(storage_read_file(storage, STORAGE_AREA_VAULTS, filename,
+                            STORAGE_MAX_FILE_BYTES,
+                            &after, &after_length) == STORAGE_READ_OK);
+    CHECK(after != NULL && before != NULL &&
+          after_length == before_length &&
+          memcmp(after, before, before_length) == 0);
+    storage_free(after);
+    after = NULL;
+
+    CHECK(vault_lock_acquire(storage, session, &lock) == 1);
+    storage_test_fail_atomic_precommit_once();
+    CHECK(vault_replace_if_current(
+              storage, session, &lock,
+              payload, sizeof(payload) - 1,
+              payload, sizeof(payload) - 1) == 0);
+    storage_lock_release(&lock);
+    CHECK(storage_read_file(storage, STORAGE_AREA_VAULTS, filename,
+                            STORAGE_MAX_FILE_BYTES,
+                            &after, &after_length) == STORAGE_READ_OK);
+    CHECK(after != NULL && before != NULL &&
+          after_length == before_length &&
+          memcmp(after, before, before_length) == 0);
+    check_round_trip(storage, session, payload, sizeof(payload) - 1);
+
+    storage_free(after);
+    storage_free(before);
 }
 
 static void test_empty_vault(const struct storage *storage,
@@ -438,6 +499,111 @@ static void test_empty_vault(const struct storage *storage,
                             &serialized_length) == STORAGE_READ_OK);
     CHECK(serialized_length == TEST_FIXED_BYTES);
     storage_free(serialized);
+}
+
+static void test_external_changes_fail_closed(
+    struct storage *storage, struct account_session *session)
+{
+    static const unsigned char original[] = "authenticated-current-state";
+    static const unsigned char replacement[] = "new-state-must-not-commit";
+    static const unsigned char corrupted[] = "random-corrupted-vault";
+    struct storage_lock lock = STORAGE_LOCK_INITIALIZER;
+    struct storage_lock replacement_lock = STORAGE_LOCK_INITIALIZER;
+    unsigned char *users_database = NULL;
+    unsigned char *stored = NULL;
+    size_t users_database_length = 0;
+    size_t stored_length = 0;
+    char filename[TEST_FILENAME_BYTES];
+    char lock_filename[TEST_FILENAME_BYTES];
+
+    make_filename(session->user_id, filename);
+    memcpy(lock_filename, filename, sizeof(lock_filename));
+    memcpy(lock_filename + 32, ".lock", sizeof(".lock"));
+    CHECK(vault_write(storage, session, original, sizeof(original) - 1) == 1);
+    CHECK(vault_lock_acquire(storage, session, &lock) == 1);
+    CHECK(vault_verify_current(storage, session, &lock,
+                               original, sizeof(original) - 1) == 1);
+
+    CHECK(storage_remove_file(storage, STORAGE_AREA_VAULTS, filename) == 1);
+    CHECK(vault_verify_current(storage, session, &lock,
+                               original, sizeof(original) - 1) == 0);
+    CHECK(vault_replace_if_current(storage, session, &lock,
+                                   original, sizeof(original) - 1,
+                                   replacement, sizeof(replacement) - 1) == 0);
+    CHECK(vault_read(storage, session, &stored,
+                     &stored_length) == VAULT_READ_MISSING);
+    CHECK(stored == NULL && stored_length == 0);
+    CHECK(vault_write(storage, session, original, sizeof(original) - 1) == 1);
+
+    CHECK(storage_atomic_write(storage, STORAGE_AREA_VAULTS, filename,
+                               corrupted, sizeof(corrupted) - 1) == 1);
+    CHECK(vault_verify_current(storage, session, &lock,
+                               original, sizeof(original) - 1) == 0);
+    CHECK(vault_replace_if_current(storage, session, &lock,
+                                   original, sizeof(original) - 1,
+                                   replacement, sizeof(replacement) - 1) == 0);
+    CHECK(storage_read_file(storage, STORAGE_AREA_VAULTS, filename, 1024,
+                            &stored, &stored_length) == STORAGE_READ_OK);
+    CHECK(stored_length == sizeof(corrupted) - 1 &&
+          memcmp(stored, corrupted, sizeof(corrupted) - 1) == 0);
+    storage_free(stored);
+    stored = NULL;
+    CHECK(storage_atomic_write(storage, STORAGE_AREA_VAULTS, filename,
+                               corrupted, sizeof(corrupted) - 1) == 1);
+    CHECK(unlinkat(storage->vaults_fd, filename, 0) == 0);
+    CHECK(vault_write(storage, session, original, sizeof(original) - 1) == 1);
+
+    CHECK(fchmodat(storage->vaults_fd, filename, 0644, 0) == 0);
+    CHECK(vault_verify_current(storage, session, &lock,
+                               original, sizeof(original) - 1) == 0);
+    CHECK(vault_replace_if_current(storage, session, &lock,
+                                   original, sizeof(original) - 1,
+                                   replacement, sizeof(replacement) - 1) == 0);
+    CHECK(fchmodat(storage->vaults_fd, filename, STORAGE_FILE_MODE, 0) == 0);
+    check_round_trip(storage, session, original, sizeof(original) - 1);
+
+    CHECK(unlinkat(storage->vaults_fd, lock_filename, 0) == 0);
+    CHECK(storage_atomic_write(storage, STORAGE_AREA_VAULTS,
+                               lock_filename, NULL, 0) == 1);
+    CHECK(vault_lock_validate(storage, session, &lock) == 0);
+    CHECK(vault_replace_if_current(storage, session, &lock,
+                                   original, sizeof(original) - 1,
+                                   replacement, sizeof(replacement) - 1) == 0);
+    CHECK(vault_lock_acquire(storage, session, &replacement_lock) == 1);
+    CHECK(vault_lock_validate(storage, session, &replacement_lock) == 1);
+    storage_lock_release(&replacement_lock);
+    storage_lock_release(&lock);
+
+    CHECK(storage_read_file(storage, STORAGE_AREA_ROOT, "users.db",
+                            STORAGE_MAX_FILE_BYTES,
+                            &users_database,
+                            &users_database_length) == STORAGE_READ_OK);
+    CHECK(storage_remove_file(storage, STORAGE_AREA_ROOT, "users.db") == 1);
+    CHECK(account_session_is_valid(session) == 1);
+    CHECK(vault_lock_acquire(storage, session, &lock) == 1);
+    CHECK(vault_verify_current(storage, session, &lock,
+                               original, sizeof(original) - 1) == 1);
+    {
+        struct account_session failed = ACCOUNT_SESSION_INITIALIZER;
+
+        CHECK(account_unlock(storage, "VaultUser", 9,
+                             "dummy-vault-master-password",
+                             sizeof("dummy-vault-master-password") - 1,
+                             &failed) == 0);
+        CHECK(account_session_is_valid(&failed) == 0);
+    }
+    CHECK(storage_atomic_write(storage, STORAGE_AREA_ROOT, "users.db",
+                               users_database, users_database_length) == 1);
+    storage_free(users_database);
+    storage_lock_release(&lock);
+
+    storage_close(storage);
+    CHECK(storage_init(storage) == 1);
+    CHECK(account_unlock(storage, "VaultUser", 9,
+                         "dummy-vault-master-password",
+                         sizeof("dummy-vault-master-password") - 1,
+                         session) == 1);
+    check_round_trip(storage, session, original, sizeof(original) - 1);
 }
 
 static void expect_read_error(const struct storage *storage,
@@ -592,8 +758,10 @@ int main(void)
         test_file_format_and_replacement(&storage, &session,
                                          &valid_file, &valid_file_length);
         test_committed_write_reconciliation(&storage, &session);
+        test_precommit_failure_is_not_reconciled(&storage, &session);
         test_concurrent_updates(&storage, &session);
         test_empty_vault(&storage, &session);
+        test_external_changes_fail_closed(&storage, &session);
         if (valid_file != NULL) {
             test_wrong_session_and_authenticated_header(
                 &storage, &session, valid_file, valid_file_length);

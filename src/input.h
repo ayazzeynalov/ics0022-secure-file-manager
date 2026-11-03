@@ -21,6 +21,11 @@ int input_read_line(const char *prompt, char *buffer, size_t capacity,
 int input_read_secret(const char *prompt, char *buffer, size_t capacity,
                       size_t *length);
 
+/* Discards bytes already queued by the terminal before a security-sensitive
+ * confirmation prompt. This prevents pasted future answers from confirming an
+ * action without a fresh response to that prompt. */
+int input_discard_pending(void);
+
 int input_interrupted_signal(void);
 
 #endif

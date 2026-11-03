@@ -7,9 +7,11 @@
 #include "input.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static unsigned int checks;
@@ -192,18 +194,70 @@ static void test_invalid_arguments_clear(void)
     CHECK(all_zero(buffer, sizeof(buffer)));
 }
 
-static void test_interruption_clears(void)
+static void check_interruption_clears(int signal_number)
 {
     char buffer[8];
     size_t length = 99;
 
     memset(buffer, 0xa5, sizeof(buffer));
     CHECK(input_initialize());
-    CHECK(raise(SIGINT) == 0);
+    CHECK(raise(signal_number) == 0);
+    CHECK(input_interrupted_signal() == signal_number);
     CHECK(input_read_line("", buffer, sizeof(buffer), &length) ==
           INPUT_READ_INTERRUPTED);
     CHECK(length == 0);
     CHECK(all_zero(buffer, sizeof(buffer)));
+}
+
+static void check_blocked_interruption_wakes(int signal_number)
+{
+    char buffer[8];
+    size_t length = 99;
+    int input_pipe[2] = {-1, -1};
+    int saved_stdin = dup(STDIN_FILENO);
+    int status = 0;
+    pid_t child;
+
+    CHECK(saved_stdin >= 0);
+    CHECK(pipe(input_pipe) == 0);
+    if (saved_stdin < 0 || input_pipe[0] < 0) {
+        if (saved_stdin >= 0) {
+            close(saved_stdin);
+        }
+        return;
+    }
+    CHECK(dup2(input_pipe[0], STDIN_FILENO) >= 0);
+    close(input_pipe[0]);
+    CHECK(input_initialize());
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        (void)poll(NULL, 0, 50);
+        if (kill(getppid(), signal_number) != 0) {
+            _exit(1);
+        }
+        /* Bound a broken implementation: supply input after the signal so the
+         * test reports a wrong result instead of hanging indefinitely. */
+        (void)poll(NULL, 0, 250);
+        (void)write(input_pipe[1], "\n", 1);
+        _exit(0);
+    }
+    close(input_pipe[1]);
+    input_pipe[1] = -1;
+    if (child > 0) {
+        memset(buffer, 0xa5, sizeof(buffer));
+        CHECK(input_read_line("", buffer, sizeof(buffer), &length) ==
+              INPUT_READ_INTERRUPTED);
+        CHECK(input_interrupted_signal() == signal_number);
+        CHECK(length == 0);
+        CHECK(all_zero(buffer, sizeof(buffer)));
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    if (input_pipe[1] >= 0) {
+        close(input_pipe[1]);
+    }
+    CHECK(restore_stdin(saved_stdin));
 }
 
 int main(void)
@@ -213,7 +267,13 @@ int main(void)
     test_descriptor_error_clears();
     test_nonterminal_secret_failure();
     test_invalid_arguments_clear();
-    test_interruption_clears();
+    check_interruption_clears(SIGINT);
+    check_interruption_clears(SIGTSTP);
+    check_blocked_interruption_wakes(SIGINT);
+    check_blocked_interruption_wakes(SIGTSTP);
+    check_blocked_interruption_wakes(SIGTERM);
+    check_blocked_interruption_wakes(SIGHUP);
+    check_blocked_interruption_wakes(SIGQUIT);
 
     if (failures != 0) {
         fprintf(stderr, "FAIL: %u of %u input checks\n", failures, checks);

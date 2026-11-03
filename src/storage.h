@@ -17,12 +17,21 @@ enum storage_area {
     STORAGE_AREA_VAULTS = 1
 };
 
+/* An atomic installation can fail after renameat() has installed the new
+ * pathname but before the containing directory has been synchronized. */
+enum storage_atomic_result {
+    STORAGE_ATOMIC_ERROR = 0,
+    STORAGE_ATOMIC_DURABLE = 1,
+    STORAGE_ATOMIC_INSTALLED = 2
+};
+
 struct storage {
+    int home_fd;
     int root_fd;
     int vaults_fd;
 };
 
-#define STORAGE_INITIALIZER { -1, -1 }
+#define STORAGE_INITIALIZER { -1, -1, -1 }
 
 struct storage_lock {
     int descriptor;
@@ -52,6 +61,23 @@ void storage_free(void *data);
 int storage_atomic_write(const struct storage *storage, enum storage_area area,
                          const char *filename,
                          const unsigned char *data, size_t data_length);
+enum storage_atomic_result storage_atomic_write_result(
+    const struct storage *storage, enum storage_area area,
+    const char *filename, const unsigned char *data, size_t data_length);
+
+/* Replaces an existing file only while its complete contents still match the
+ * expected bytes. This is optimistic-concurrency protection for callers that
+ * hold a logical lock but must also fail closed if a same-user process deletes
+ * or replaces the pathname behind that lock. */
+int storage_atomic_replace(const struct storage *storage,
+                           enum storage_area area, const char *filename,
+                           const unsigned char *expected,
+                           size_t expected_length,
+                           const unsigned char *data, size_t data_length);
+enum storage_atomic_result storage_atomic_replace_result(
+    const struct storage *storage, enum storage_area area,
+    const char *filename, const unsigned char *expected,
+    size_t expected_length, const unsigned char *data, size_t data_length);
 
 /* Appends while holding a stable per-file lock. Existing files must satisfy
  * the same regular-file, owner, mode and single-link checks as other storage
@@ -69,6 +95,9 @@ int storage_remove_file(const struct storage *storage, enum storage_area area,
 int storage_lock_acquire(const struct storage *storage, enum storage_area area,
                          const char *filename, struct storage_lock *lock);
 int storage_lock_is_held(const struct storage_lock *lock);
+int storage_lock_validate(const struct storage *storage,
+                          enum storage_area area, const char *filename,
+                          const struct storage_lock *lock);
 void storage_lock_release(struct storage_lock *lock);
 
 #endif
