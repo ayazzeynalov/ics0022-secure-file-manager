@@ -1040,6 +1040,53 @@ static void test_interrupted_lock_wait(const struct storage *storage)
     close(result_pipe[0]);
 }
 
+
+/* Week 12: negative tests for HOME path validation. */
+static void check_rejected_home(const char *path)
+{
+    struct storage probe = STORAGE_INITIALIZER;
+
+    CHECK(setenv("HOME", path, 1) == 0);
+    CHECK(storage_init(&probe) == 0);
+    CHECK(probe.home_fd == -1 && probe.root_fd == -1 &&
+          probe.vaults_fd == -1);
+    storage_close(&probe);
+}
+
+static void test_invalid_home_paths(const char *valid_home)
+{
+    char missing[TEST_PATH_BYTES];
+    char traversal[TEST_PATH_BYTES];
+    char link_path[TEST_PATH_BYTES];
+
+    check_rejected_home("relative-home");
+
+    if (make_path(missing, valid_home, "missing-home-component")) {
+        check_rejected_home(missing);
+    } else {
+        CHECK(0);
+    }
+
+    if (make_path(traversal, valid_home, "..")) {
+        check_rejected_home(traversal);
+    } else {
+        CHECK(0);
+    }
+
+    if (make_path(link_path, valid_home, "linked-home")) {
+        if (symlink(valid_home, link_path) == 0) {
+            check_rejected_home(link_path);
+            CHECK(unlink(link_path) == 0);
+        } else {
+            CHECK(0);
+        }
+    } else {
+        CHECK(0);
+    }
+
+    CHECK(setenv("HOME", valid_home, 1) == 0);
+}
+
 int main(void)
 {
     char home_template[TEST_PATH_BYTES];
@@ -1057,6 +1104,7 @@ int main(void)
         CHECK(remove_tree(home));
         return 1;
     }
+    test_invalid_home_paths(home);
     test_unsafe_storage_root_rejected(home);
     CHECK(storage_init(&storage) == 1);
     if (storage.root_fd >= 0 && storage.vaults_fd >= 0) {
