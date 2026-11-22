@@ -3,6 +3,21 @@
 This is a local password manager for the ICS0022 Secure Programming course. It
 is written in C17 and uses OpenSSL 3.x and POSIX APIs.
 
+## Project status
+
+Checkpoint 3 implementation is available on the
+`feature/checkpoint3-crud` branch.
+
+The application supports user authentication, encrypted credential
+storage, credential management, per-user access control, and
+structured security logging.
+
+The automated test suite passed 3,666 checks on macOS.
+Additional testing included AddressSanitizer, UndefinedBehaviorSanitizer,
+and fuzzing of credential data, the user database, and encrypted vaults.
+
+The remaining limitations are documented below.
+
 ## Implemented features
 
 The current command-line application supports:
