@@ -289,8 +289,6 @@ int vault_write(const struct storage *storage,
     if (write_result == STORAGE_ATOMIC_INSTALLED) {
         int saved_errno = errno;
 
-        /* The new pathname is installed, but directory synchronization failed.
-         * Reconcile only this explicitly post-rename outcome. */
         if (!installed_plaintext_matches(storage, session,
                                          plaintext, plaintext_length)) {
             errno = saved_errno;

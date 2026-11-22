@@ -236,8 +236,6 @@ static void check_blocked_interruption_wakes(int signal_number)
         if (kill(getppid(), signal_number) != 0) {
             _exit(1);
         }
-        /* Bound a broken implementation: supply input after the signal so the
-         * test reports a wrong result instead of hanging indefinitely. */
         (void)poll(NULL, 0, 250);
         (void)write(input_pipe[1], "\n", 1);
         _exit(0);

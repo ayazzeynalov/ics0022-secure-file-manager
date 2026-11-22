@@ -28,6 +28,11 @@
 #define TEMP_PREFIX ".securepm.tmp."
 
 void storage_test_pause_atomic_before_replace(int ready_fd, int continue_fd);
+void storage_test_fail_read_once(void);
+void storage_test_interrupt_read_once(void);
+void storage_test_early_eof_once(void);
+void storage_test_partial_read_then_error_once(void);
+void storage_test_after_read_once(void (*hook)(void *), void *context);
 
 static unsigned int checks;
 static unsigned int failures;
@@ -395,6 +400,189 @@ static void test_read_write_and_replace(const struct storage *storage,
     CHECK(make_path(vault_path, vaults, "0011223344556677.vault"));
     check_mode(users_path, STORAGE_FILE_MODE, 0);
     check_mode(vault_path, STORAGE_FILE_MODE, 0);
+}
+
+
+static void test_read_io_error(const struct storage *storage)
+{
+    static const unsigned char payload[] = "read-io-failure-check";
+    unsigned char *contents = NULL;
+    size_t contents_len = 123;
+    int read_result;
+    int read_errno;
+    int created;
+
+    created = storage_atomic_write(
+        storage, STORAGE_AREA_ROOT, "eio-case.db",
+        payload, sizeof(payload) - 1);
+    CHECK(created == 1);
+    if (!created) {
+        return;
+    }
+
+    storage_test_fail_read_once();
+    errno = 0;
+    read_result = storage_read_file(
+        storage, STORAGE_AREA_ROOT, "eio-case.db",
+        1024, &contents, &contents_len);
+    read_errno = errno;
+
+    CHECK(read_result == STORAGE_READ_ERROR);
+    CHECK(read_errno == EIO);
+    CHECK(contents == NULL && contents_len == 0);
+
+    CHECK(storage_read_file(
+        storage, STORAGE_AREA_ROOT, "eio-case.db",
+        1024, &contents, &contents_len) == STORAGE_READ_OK);
+    CHECK(contents != NULL &&
+          contents_len == sizeof(payload) - 1 &&
+          memcmp(contents, payload, sizeof(payload) - 1) == 0);
+
+    storage_free(contents);
+    CHECK(storage_remove_file(
+        storage, STORAGE_AREA_ROOT, "eio-case.db") == 1);
+}
+
+
+static void test_read_fault_scenarios(const struct storage *storage)
+{
+    static const unsigned char payload[] = "read-fault-scenarios";
+    unsigned char *contents = NULL;
+    size_t length = 999;
+    int result;
+    int saved_errno;
+
+    int created = storage_atomic_write(
+        storage, STORAGE_AREA_ROOT, "read-fault.db",
+        payload, sizeof(payload) - 1);
+
+    CHECK(created == 1);
+    if (!created) {
+        return;
+    }
+
+    storage_test_interrupt_read_once();
+
+    result = storage_read_file(
+        storage, STORAGE_AREA_ROOT, "read-fault.db",
+        1024, &contents, &length);
+
+    CHECK(result == STORAGE_READ_OK);
+    CHECK(contents != NULL &&
+          length == sizeof(payload) - 1 &&
+          memcmp(contents, payload, sizeof(payload) - 1) == 0);
+
+    storage_free(contents);
+    contents = NULL;
+    length = 999;
+
+    storage_test_early_eof_once();
+    errno = 0;
+
+    result = storage_read_file(
+        storage, STORAGE_AREA_ROOT, "read-fault.db",
+        1024, &contents, &length);
+
+    saved_errno = errno;
+
+    CHECK(result == STORAGE_READ_ERROR);
+    CHECK(saved_errno == EIO);
+    CHECK(contents == NULL && length == 0);
+
+    storage_test_partial_read_then_error_once();
+    errno = 0;
+
+    result = storage_read_file(
+        storage, STORAGE_AREA_ROOT, "read-fault.db",
+        1024, &contents, &length);
+
+    saved_errno = errno;
+
+    CHECK(result == STORAGE_READ_ERROR);
+    CHECK(saved_errno == EIO);
+    CHECK(contents == NULL && length == 0);
+
+    CHECK(storage_read_file(
+        storage, STORAGE_AREA_ROOT, "read-fault.db",
+        1024, &contents, &length) == STORAGE_READ_OK);
+
+    CHECK(contents != NULL &&
+          length == sizeof(payload) - 1 &&
+          memcmp(contents, payload, sizeof(payload) - 1) == 0);
+
+    storage_free(contents);
+
+    CHECK(storage_remove_file(
+        storage, STORAGE_AREA_ROOT, "read-fault.db") == 1);
+}
+
+
+struct read_growth_context {
+    const char *path;
+    off_t original_size;
+    int changed;
+};
+
+static void grow_file_after_read(void *argument)
+{
+    struct read_growth_context *context = argument;
+
+    context->changed =
+        truncate(context->path, context->original_size + 1) == 0;
+}
+
+static void test_read_size_change(const struct storage *storage,
+                                  const char *home)
+{
+    static const unsigned char payload[] = "size-change-test";
+    char root[TEST_PATH_BYTES];
+    char path[TEST_PATH_BYTES];
+    struct read_growth_context context;
+    unsigned char *contents = NULL;
+    size_t length = 999;
+    int paths_ok;
+    int created;
+    int result;
+    int saved_errno;
+
+    paths_ok = make_path(root, home, ".securepm") &&
+               make_path(path, root, "size-change.db");
+
+    CHECK(paths_ok);
+    if (!paths_ok) {
+        return;
+    }
+
+    created = storage_atomic_write(
+        storage, STORAGE_AREA_ROOT, "size-change.db",
+        payload, sizeof(payload) - 1);
+
+    CHECK(created == 1);
+    if (!created) {
+        return;
+    }
+
+    context.path = path;
+    context.original_size = (off_t)(sizeof(payload) - 1);
+    context.changed = 0;
+
+    storage_test_after_read_once(grow_file_after_read, &context);
+
+    errno = 0;
+    result = storage_read_file(
+        storage, STORAGE_AREA_ROOT, "size-change.db",
+        1024, &contents, &length);
+    saved_errno = errno;
+
+    CHECK(context.changed == 1);
+    CHECK(result == STORAGE_READ_ERROR);
+    CHECK(saved_errno == EIO);
+    CHECK(contents == NULL && length == 0);
+
+    storage_free(contents);
+
+    CHECK(storage_remove_file(
+        storage, STORAGE_AREA_ROOT, "size-change.db") == 1);
 }
 
 static void test_missing_and_names(const struct storage *storage)
@@ -1041,7 +1229,6 @@ static void test_interrupted_lock_wait(const struct storage *storage)
 }
 
 
-/* Week 12: negative tests for HOME path validation. */
 static void check_rejected_home(const char *path)
 {
     struct storage probe = STORAGE_INITIALIZER;
@@ -1110,6 +1297,9 @@ int main(void)
     if (storage.root_fd >= 0 && storage.vaults_fd >= 0) {
         test_directories(home);
         test_read_write_and_replace(&storage, home);
+        test_read_io_error(&storage);
+        test_read_fault_scenarios(&storage);
+        test_read_size_change(&storage, home);
         test_missing_and_names(&storage);
         test_symlink_and_unsafe_objects(&storage, home);
 #ifdef __APPLE__

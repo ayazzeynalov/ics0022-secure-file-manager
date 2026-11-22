@@ -3,7 +3,7 @@ CFLAGS ?= -Wall -Wextra -Wpedantic -Wformat=2 -Wformat-security
 PKG_CONFIG ?= pkg-config
 PTY_LIBS ?= $(if $(filter Linux,$(shell uname -s)),-lutil,)
 
-# Prefer pkg-config; Homebrew OpenSSL is outside macOS's default search path.
+# OpenSSL paths
 OPENSSL_PREFIX ?= $(shell command -v brew >/dev/null 2>&1 && brew --prefix openssl@3 2>/dev/null)
 ifneq ($(strip $(OPENSSL_PREFIX)),)
 OPENSSL_CFLAGS = -I$(OPENSSL_PREFIX)/include

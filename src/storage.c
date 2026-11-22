@@ -48,6 +48,41 @@ static size_t append_write_limit_once;
 static int atomic_pause_ready_fd = -1;
 static int atomic_pause_continue_fd = -1;
 
+static int read_failure_once;
+
+static int read_interrupt_once;
+static int read_early_eof_once;
+static int read_partial_error_stage;
+
+static void (*read_postcheck_hook)(void *);
+static void *read_postcheck_context;
+
+void storage_test_after_read_once(void (*hook)(void *), void *context)
+{
+    read_postcheck_hook = hook;
+    read_postcheck_context = context;
+}
+
+void storage_test_interrupt_read_once(void)
+{
+    read_interrupt_once = 1;
+}
+
+void storage_test_early_eof_once(void)
+{
+    read_early_eof_once = 1;
+}
+
+void storage_test_partial_read_then_error_once(void)
+{
+    read_partial_error_stage = 1;
+}
+
+void storage_test_fail_read_once(void)
+{
+    read_failure_once = 1;
+}
+
 void storage_test_fail_atomic_sync_after(unsigned int writes)
 {
     atomic_sync_failure_countdown = writes;
@@ -537,7 +572,32 @@ int storage_read_file(const struct storage *storage, enum storage_area area,
         goto cleanup;
     }
     while (offset < expected) {
+#ifdef SECUREPM_TEST_FAULTS
+        ssize_t count;
+        if (read_interrupt_once) {
+            read_interrupt_once = 0;
+            errno = EINTR;
+            count = -1;
+        } else if (read_early_eof_once) {
+            read_early_eof_once = 0;
+            count = 0;
+        } else if (read_partial_error_stage == 1) {
+            count = read(file_fd, buffer + offset, 1);
+            read_partial_error_stage = count == 1 ? 2 : 0;
+        } else if (read_partial_error_stage == 2) {
+            read_partial_error_stage = 0;
+            errno = EIO;
+            count = -1;
+        } else if (read_failure_once) {
+            read_failure_once = 0;
+            errno = EIO;
+            count = -1;
+        } else {
+            count = read(file_fd, buffer + offset, expected - offset);
+        }
+#else
         ssize_t count = read(file_fd, buffer + offset, expected - offset);
+#endif
         if (count > 0) {
             offset += (size_t)count;
         } else if (count == 0) {
@@ -560,6 +620,16 @@ int storage_read_file(const struct storage *storage, enum storage_area area,
             goto cleanup;
         }
     }
+#ifdef SECUREPM_TEST_FAULTS
+    if (read_postcheck_hook != NULL) {
+        void (*hook)(void *) = read_postcheck_hook;
+        void *context = read_postcheck_context;
+
+        read_postcheck_hook = NULL;
+        read_postcheck_context = NULL;
+        hook(context);
+    }
+#endif
     if (!secure_file_descriptor(file_fd, &after) ||
         after.st_dev != before.st_dev ||
         after.st_ino != before.st_ino || after.st_size != before.st_size ||

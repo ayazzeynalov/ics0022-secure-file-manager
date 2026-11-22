@@ -17,8 +17,6 @@ enum storage_area {
     STORAGE_AREA_VAULTS = 1
 };
 
-/* An atomic installation can fail after renameat() has installed the new
- * pathname but before the containing directory has been synchronized. */
 enum storage_atomic_result {
     STORAGE_ATOMIC_ERROR = 0,
     STORAGE_ATOMIC_DURABLE = 1,
@@ -40,24 +38,14 @@ struct storage_lock {
 
 #define STORAGE_LOCK_INITIALIZER { -1, 0 }
 
-/* Uses the absolute HOME environment path. Every path component must be a real
- * directory rather than a symlink, and HOME must be owned by the effective user.
- * Callers must initialize the context with STORAGE_INITIALIZER. */
 int storage_init(struct storage *storage);
 void storage_close(struct storage *storage);
 
-/* Filenames are single controlled components: 1..128 ASCII bytes, beginning
- * with an alphanumeric byte and containing only alphanumerics, '.', '_', '-'.
- * The read result is allocated with malloc() and must be released with
- * storage_free(). Missing files are distinct from unsafe/error conditions. */
 int storage_read_file(const struct storage *storage, enum storage_area area,
                       const char *filename, size_t maximum_size,
                       unsigned char **data, size_t *data_length);
 void storage_free(void *data);
 
-/* Atomically installs non-secret metadata or already-encrypted bytes. This
- * module cannot identify plaintext; callers must never pass passwords, VMKs,
- * or unencrypted credential records. */
 int storage_atomic_write(const struct storage *storage, enum storage_area area,
                          const char *filename,
                          const unsigned char *data, size_t data_length);
@@ -65,10 +53,6 @@ enum storage_atomic_result storage_atomic_write_result(
     const struct storage *storage, enum storage_area area,
     const char *filename, const unsigned char *data, size_t data_length);
 
-/* Replaces an existing file only while its complete contents still match the
- * expected bytes. This is optimistic-concurrency protection for callers that
- * hold a logical lock but must also fail closed if a same-user process deletes
- * or replaces the pathname behind that lock. */
 int storage_atomic_replace(const struct storage *storage,
                            enum storage_area area, const char *filename,
                            const unsigned char *expected,
@@ -79,10 +63,6 @@ enum storage_atomic_result storage_atomic_replace_result(
     const char *filename, const unsigned char *expected,
     size_t expected_length, const unsigned char *data, size_t data_length);
 
-/* Appends while holding a stable per-file lock. Existing files must satisfy
- * the same regular-file, owner, mode and single-link checks as other storage
- * objects. The complete file, including the new data, is bounded by
- * maximum_size. */
 int storage_append_file(const struct storage *storage, enum storage_area area,
                         const char *filename,
                         const unsigned char *data, size_t data_length,
@@ -90,8 +70,6 @@ int storage_append_file(const struct storage *storage, enum storage_area area,
 int storage_remove_file(const struct storage *storage, enum storage_area area,
                         const char *filename);
 
-/* Lock files are stable objects and are never replaced by atomic writes.
- * An interrupted blocking wait fails with errno set to EINTR. */
 int storage_lock_acquire(const struct storage *storage, enum storage_area area,
                          const char *filename, struct storage_lock *lock);
 int storage_lock_is_held(const struct storage_lock *lock);

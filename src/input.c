@@ -142,8 +142,6 @@ static int restore_secret_terminal(void)
 
     if (secret_terminal_saved) {
         do {
-            /* Discard unread secret input before returning the terminal to the
-             * caller or shell, especially after interruption mid-line. */
             result = tcsetattr(secret_terminal_fd, TCSAFLUSH,
                                &secret_terminal);
         } while (result != 0 && errno == EINTR);

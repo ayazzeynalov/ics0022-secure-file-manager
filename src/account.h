@@ -22,21 +22,13 @@ struct account_session {
 
 #define ACCOUNT_SESSION_INITIALIZER {0, {0}, {0}, {0}}
 
-/* Registration returns CREATED for new metadata or RECOVERY when a matching
- * interrupted registration can resume. New passwords must contain at least
- * 12 bytes. The caller owns and clears supplied password buffers. */
 int account_register(const struct storage *storage,
                      const char *username, size_t username_length,
                      const char *master_password, size_t password_length);
 
-/* Removes the pending marker only after the caller has ensured that a valid
- * encrypted vault exists. Repeating completion for the same session succeeds. */
 int account_registration_complete(const struct storage *storage,
                                   const struct account_session *session);
 
-/* Unlock retains the 1..CRYPTO_PASSWORD_MAX_BYTES range for existing accounts.
- * The session is locked before every attempt, and the VMK is published only
- * after verifier validation and authenticated VMK unwrapping both succeed. */
 int account_unlock(const struct storage *storage,
                    const char *username, size_t username_length,
                    const char *master_password, size_t password_length,
@@ -44,9 +36,6 @@ int account_unlock(const struct storage *storage,
 
 void account_session_lock(struct account_session *session);
 
-/* A valid session is a bearer capability issued by account_unlock() in this
- * process. This prevents a caller from authorizing vault access by setting an
- * exposed flag in an otherwise fabricated structure. */
 int account_session_is_valid(const struct account_session *session);
 
 #endif

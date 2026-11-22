@@ -23,8 +23,6 @@ enum audit_outcome {
     AUDIT_OUTCOME_CANCELLED
 };
 
-/* Writes one fixed-schema JSON Lines record. No caller-controlled text or
- * identifying data is accepted. The caller's errno value is always restored. */
 int audit_log_event(const struct storage *storage, enum audit_event event,
                     enum audit_outcome outcome);
 

@@ -34,12 +34,8 @@ struct user_database {
 
 void user_db_init(struct user_database *database);
 
-/* Version 1 accepts 1..64 visible ASCII bytes. Comparisons are byte-exact and
- * case-sensitive. The supplied string does not need a NUL terminator. */
 int user_db_username_valid(const char *username, size_t username_length);
 
-/* Adds only fully valid version 1 records using the production scrypt profile.
- * Usernames and 16-byte application-generated user IDs must be unique. */
 int user_db_add(struct user_database *database,
                 const struct user_record *record);
 const struct user_record *user_db_find_username(
@@ -49,8 +45,6 @@ const struct user_record *user_db_find_user_id(
     const struct user_database *database,
     const unsigned char *user_id, size_t user_id_length);
 
-/* A missing users.db loads as an empty database. Malformed files fail and do
- * not replace the caller's database. All persistence uses the storage module. */
 int user_db_load(const struct storage *storage,
                  struct user_database *database);
 int user_db_save(const struct storage *storage,
