@@ -192,6 +192,7 @@ static int register_user(const struct storage *storage)
     size_t existing_payload_length = 0;
     int read_result;
     int registration_result;
+    int unlock_result = 0;
     int vault_result;
     int action = ACTION_CONTINUE;
     enum audit_outcome audit_outcome = AUDIT_OUTCOME_FAILURE;
@@ -241,10 +242,13 @@ static int register_user(const struct storage *storage)
     empty = malloc(sizeof(*empty));
     if (empty != NULL) {
         credentials_init(empty);
+        unlock_result = account_unlock(storage, username,
+                                       username_length, password,
+                                       password_length, &session);
     }
-    if (empty == NULL ||
-        !account_unlock(storage, username, username_length,
-                        password, password_length, &session) ||
+    OPENSSL_cleanse(password, sizeof(password));
+    password_length = 0;
+    if (empty == NULL || !unlock_result ||
         !vault_lock_acquire(storage, &session, &vault_lock)) {
         puts("Account metadata was created, but encrypted vault "
              "initialization failed. Registration is incomplete.");
@@ -267,10 +271,10 @@ static int register_user(const struct storage *storage)
     audit_outcome = AUDIT_OUTCOME_SUCCESS;
 
 cleanup:
-    record_audit_event(storage, AUDIT_EVENT_USER_REGISTRATION,
-                       audit_outcome);
     OPENSSL_cleanse(password, sizeof(password));
     OPENSSL_cleanse(confirmation, sizeof(confirmation));
+    record_audit_event(storage, AUDIT_EVENT_USER_REGISTRATION,
+                       audit_outcome);
     OPENSSL_cleanse(username, sizeof(username));
     vault_secure_free(existing_payload, existing_payload_length);
     if (empty != NULL) {
@@ -856,6 +860,8 @@ static int login_user(const struct storage *storage,
     have_attempt_start = clock_gettime(CLOCK_MONOTONIC, &attempt_start) == 0;
     if (!account_unlock(storage, username, username_length,
                         password, password_length, &session)) {
+        OPENSSL_cleanse(password, sizeof(password));
+        password_length = 0;
         throttle_login_failure(throttle,
                                have_attempt_start ? &attempt_start : NULL);
         puts("Login failed.");
@@ -896,6 +902,7 @@ static int login_user(const struct storage *storage,
     action = authenticated_menu(storage, &session, &vault_lock, collection);
 
 cleanup:
+    OPENSSL_cleanse(password, sizeof(password));
     if (vault_load_attempted && !vault_load_succeeded) {
         record_audit_event(storage, AUDIT_EVENT_VAULT_LOAD,
                            AUDIT_OUTCOME_FAILURE);
@@ -903,7 +910,6 @@ cleanup:
     if (!login_event_recorded) {
         record_audit_event(storage, AUDIT_EVENT_LOGIN, login_outcome);
     }
-    OPENSSL_cleanse(password, sizeof(password));
     OPENSSL_cleanse(username, sizeof(username));
     vault_secure_free(payload, payload_length);
     if (collection != NULL) {
