@@ -2,4 +2,7 @@
 #define SECUREPM_CLIPBOARD_H
 #include <stddef.h>
 int clipboard_copy(const unsigned char *password, size_t length);
+void clipboard_clear(void);
+void clipboard_service(void);
+int clipboard_poll_timeout(void);
 #endif

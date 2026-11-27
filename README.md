@@ -94,13 +94,15 @@ atomically while the user's vault lock is held. Viewing displays the record ID,
 label, username, and notes, and always keeps the password hidden in terminal
 output. Type `yes` at the confirmation prompt to copy it to the system
 clipboard. Paste it into the intended application and clear the clipboard
-after use. Other applications and clipboard history tools may read it; the
-password manager does not automatically clear it. Listing never displays
+after use. The application attempts to clear unchanged clipboard text after
+30 seconds, or sooner on session lock or normal exit. Other applications and
+clipboard history tools may read or retain it. Listing never displays
 passwords. Passwords are never accepted as command-line arguments. Run
 `./securepm --help` for the command summary.
 
 On macOS, retrieval uses `/usr/bin/pbcopy`. On Linux, it requires a graphical
-Wayland session with `/usr/bin/wl-copy` or an X11 session with `/usr/bin/xclip`.
+Wayland session with `/usr/bin/wl-copy` and `/usr/bin/wl-paste`, or an X11
+session with `/usr/bin/xclip`.
 The helper receives password bytes through a local socket, not command-line
 arguments or a shell. Without a supported helper, copying fails with a generic
 message; there is no cleartext terminal fallback. The actual graphical Linux
@@ -355,8 +357,13 @@ security audit or a benchmark of password-guessing resistance.
 Stored passwords are available to the authenticated process during an
 operation and can be copied to the operating system clipboard after explicit
 confirmation. Clipboard contents are outside the encrypted vault and may
-remain accessible until the user clears them. There is no password generator
-or automatic clipboard expiry. The test backend is built separately and is
+remain accessible to other applications. Automatic expiry is best-effort: a
+keyed HMAC checks that the current text matches the copied password without
+retaining a plaintext copy. Clipboard read and clear are separate operations;
+a concurrent clipboard change, helper failure, clipboard history, process
+termination or system suspension can defeat cleanup. The timer is serviced
+while waiting for input; blocking operations can delay it. There is no password
+generator. The test backend is built separately and is
 not part of the production executable.
 
 The audit log intentionally has no account identifiers, tamper-evident chain,
@@ -398,3 +405,10 @@ trusted external storage service. Removing `users.db` does not revoke an
 already-issued in-process session capability; the current session can continue
 only while its vault and lock remain valid, and new logins fail closed until the
 database is safely restored.
+
+Clipboard lifecycle regression: `make test-clipboard` (isolated dummy clipboard,
+2-second test-only expiry; production uses 30 seconds).
+On macOS, optionally verify the native clipboard using
+`python3 -B tests/test_clipboard_macos.py --overwrite-clipboard` after building.
+This deliberately replaces the current clipboard with dummy data; do not use
+it while the test runs. No real vault is used.

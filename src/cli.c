@@ -506,6 +506,7 @@ static int view_credential(const struct storage *storage,
         goto cleanup;
     }
     puts("Password copied.");
+    puts("Clipboard expires after 30 seconds; locking or exiting clears it sooner if unchanged.");
     record_audit_event(storage, AUDIT_EVENT_PASSWORD_COPY,
                        AUDIT_OUTCOME_SUCCESS);
 
@@ -999,6 +1000,7 @@ cleanup:
         }
     }
     storage_lock_release(&vault_lock);
+    clipboard_clear();
     return action;
 }
 

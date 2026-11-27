@@ -26,7 +26,7 @@ DEP = $(OBJ:.o=.d) build/test_crypto.d build/test_auth.d build/test_storage.d \
 	build/test_audit.d build/test_access_control.d build/storage_test.d \
 	build/clipboard_test.d
 
-.PHONY: all clean test test-snapshot check-openssl
+.PHONY: all clean test test-snapshot test-clipboard check-openssl
 all: $(TARGET)
 
 $(TARGET): $(OBJ) | check-openssl
@@ -117,7 +117,7 @@ build/test_cli: build/test_cli.o
 build/test_input.o: tests/test_input.c | build check-openssl
 	$(CC) $(CPPFLAGS) -Isrc $(OPENSSL_CFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
 
-build/test_input: build/test_input.o build/input.o | check-openssl
+build/test_input: build/test_input.o build/input.o build/clipboard_test.o build/crypto.o | check-openssl
 	$(CC) $(LDFLAGS) $^ $(OPENSSL_LIBS) $(LDLIBS) -o $@
 
 build/clipboard_test.o: src/clipboard.c | build check-openssl
@@ -148,6 +148,9 @@ test: $(TARGET) build/securepm_test build/test_clipboard_sink build/test_crypto 
 
 test-snapshot: build/securepm_test build/test_clipboard_sink
 	python3 tests/test_session_snapshot.py
+
+test-clipboard: build/securepm_test build/test_clipboard_sink
+	python3 -B tests/test_clipboard_expiry.py
 
 clean:
 	rm -rf build

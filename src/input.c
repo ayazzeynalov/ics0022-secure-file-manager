@@ -5,6 +5,7 @@
 #endif
 
 #include "input.h"
+#include "clipboard.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -212,7 +213,16 @@ static int wait_for_input(void)
         }
         descriptors[0].revents = 0;
         descriptors[1].revents = 0;
-        result = poll(descriptors, 2, -1);
+        clipboard_service();
+        result = poll(descriptors, 2, clipboard_poll_timeout());
+        if (result < 0) {
+            int saved_errno = errno;
+            clipboard_service();
+            errno = saved_errno;
+        } else {
+            clipboard_service();
+        }
+        if (result == 0) continue;
         if (result < 0) {
             if (errno == EINTR) {
                 if (interrupted_signal != 0) {
