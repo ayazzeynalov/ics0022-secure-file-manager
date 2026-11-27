@@ -17,6 +17,8 @@
 #define VAULT_MAX_FILE_BYTES (VAULT_FIXED_BYTES + VAULT_MAX_PLAINTEXT_BYTES)
 #define VAULT_FILENAME_BYTES \
     (USER_DB_USER_ID_BYTES * 2 + sizeof(".vault"))
+#define VAULT_LOCK_FILENAME_BYTES \
+    (USER_DB_USER_ID_BYTES * 2 + sizeof(".lock"))
 
 static const unsigned char vault_magic[VAULT_MAGIC_BYTES] = {
     'S', 'P', 'M', 'V', 'A', 'U', 'L', 'T'
@@ -24,24 +26,64 @@ static const unsigned char vault_magic[VAULT_MAGIC_BYTES] = {
 
 static int valid_session(const struct account_session *session)
 {
-    return session != NULL && session->unlocked == 1;
+    return account_session_is_valid(session);
 }
 
-static int vault_filename(const unsigned char user_id[USER_DB_USER_ID_BYTES],
-                          char filename[VAULT_FILENAME_BYTES])
+static int user_file_name(const unsigned char user_id[USER_DB_USER_ID_BYTES],
+                          const char *suffix, size_t suffix_length,
+                          char *filename)
 {
     static const char hexadecimal[] = "0123456789abcdef";
     size_t position = 0;
 
-    if (user_id == NULL || filename == NULL) {
+    if (user_id == NULL || suffix == NULL || suffix_length == 0 ||
+        filename == NULL) {
         return 0;
     }
     for (size_t index = 0; index < USER_DB_USER_ID_BYTES; ++index) {
         filename[position++] = hexadecimal[user_id[index] >> 4];
         filename[position++] = hexadecimal[user_id[index] & 0x0f];
     }
-    memcpy(filename + position, ".vault", sizeof(".vault"));
+    memcpy(filename + position, suffix, suffix_length);
     return 1;
+}
+
+static int vault_filename(const unsigned char user_id[USER_DB_USER_ID_BYTES],
+                          char filename[VAULT_FILENAME_BYTES])
+{
+    return user_file_name(user_id, ".vault", sizeof(".vault"), filename);
+}
+
+int vault_lock_acquire(const struct storage *storage,
+                       const struct account_session *session,
+                       struct storage_lock *lock)
+{
+    char filename[VAULT_LOCK_FILENAME_BYTES];
+
+    if (storage == NULL || !valid_session(session) ||
+        !user_file_name(session->user_id, ".lock", sizeof(".lock"),
+                        filename)) {
+        errno = EINVAL;
+        return 0;
+    }
+    return storage_lock_acquire(storage, STORAGE_AREA_VAULTS,
+                                filename, lock);
+}
+
+int vault_lock_validate(const struct storage *storage,
+                        const struct account_session *session,
+                        const struct storage_lock *lock)
+{
+    char filename[VAULT_LOCK_FILENAME_BYTES];
+
+    if (storage == NULL || !valid_session(session) ||
+        !user_file_name(session->user_id, ".lock", sizeof(".lock"),
+                        filename)) {
+        errno = EINVAL;
+        return 0;
+    }
+    return storage_lock_validate(storage, STORAGE_AREA_VAULTS,
+                                 filename, lock);
 }
 
 static void write_u32(unsigned char output[4], uint32_t value)
@@ -72,26 +114,28 @@ static void build_aad(unsigned char aad[VAULT_AAD_BYTES],
               ciphertext_length);
 }
 
-int vault_write(const struct storage *storage,
-                const struct account_session *session,
-                const unsigned char *plaintext, size_t plaintext_length)
+static int encrypt_serialized(
+    const struct account_session *session,
+    const unsigned char *plaintext, size_t plaintext_length,
+    unsigned char **serialized_result, size_t *serialized_length_result)
 {
     unsigned char *serialized = NULL;
     unsigned char *ciphertext;
     unsigned char *nonce;
     unsigned char *tag;
-    char filename[VAULT_FILENAME_BYTES];
     size_t ciphertext_length = 0;
     size_t serialized_length;
     int success = 0;
 
-    if (storage == NULL || !valid_session(session) ||
+    if (serialized_result == NULL || serialized_length_result == NULL ||
+        !valid_session(session) ||
         (plaintext == NULL && plaintext_length != 0) ||
-        plaintext_length > VAULT_MAX_PLAINTEXT_BYTES ||
-        !vault_filename(session->user_id, filename)) {
+        plaintext_length > VAULT_MAX_PLAINTEXT_BYTES) {
         errno = EINVAL;
         return 0;
     }
+    *serialized_result = NULL;
+    *serialized_length_result = 0;
     serialized_length = VAULT_FIXED_BYTES + plaintext_length;
     serialized = malloc(serialized_length);
     if (serialized == NULL) {
@@ -108,11 +152,12 @@ int vault_write(const struct storage *storage,
                                    &ciphertext_length,
                                    nonce, CRYPTO_GCM_NONCE_BYTES,
                                    tag, CRYPTO_GCM_TAG_BYTES) ||
-        ciphertext_length != plaintext_length ||
-        !storage_atomic_write(storage, STORAGE_AREA_VAULTS, filename,
-                              serialized, serialized_length)) {
+        ciphertext_length != plaintext_length) {
         goto cleanup;
     }
+    *serialized_result = serialized;
+    *serialized_length_result = serialized_length;
+    serialized = NULL;
     success = 1;
 
 cleanup:
@@ -145,40 +190,21 @@ static int validate_serialized(const unsigned char *serialized,
     return 1;
 }
 
-int vault_read(const struct storage *storage,
-               const struct account_session *session,
-               unsigned char **plaintext, size_t *plaintext_length)
+static int decrypt_serialized(
+    const unsigned char *serialized, size_t serialized_length,
+    const struct account_session *session,
+    unsigned char **plaintext, size_t *plaintext_length)
 {
-    unsigned char *serialized = NULL;
     unsigned char *result = NULL;
-    char filename[VAULT_FILENAME_BYTES];
-    size_t serialized_length = 0;
     size_t ciphertext_length = 0;
     size_t decrypted_length = 0;
-    int read_result;
-    int result_status = VAULT_READ_ERROR;
+    int success = 0;
 
-    if (plaintext == NULL || plaintext_length == NULL) {
-        errno = EINVAL;
-        return VAULT_READ_ERROR;
-    }
     *plaintext = NULL;
     *plaintext_length = 0;
-    if (storage == NULL || !valid_session(session) ||
-        !vault_filename(session->user_id, filename)) {
-        errno = EINVAL;
-        return VAULT_READ_ERROR;
-    }
-    read_result = storage_read_file(storage, STORAGE_AREA_VAULTS, filename,
-                                    VAULT_MAX_FILE_BYTES,
-                                    &serialized, &serialized_length);
-    if (read_result == STORAGE_READ_MISSING) {
-        return VAULT_READ_MISSING;
-    }
-    if (read_result != STORAGE_READ_OK ||
-        !validate_serialized(serialized, serialized_length, session,
+    if (!validate_serialized(serialized, serialized_length, session,
                              &ciphertext_length)) {
-        goto cleanup;
+        return 0;
     }
     result = OPENSSL_malloc(ciphertext_length == 0 ? 1 : ciphertext_length);
     if (result == NULL ||
@@ -196,15 +222,213 @@ int vault_read(const struct storage *storage,
     *plaintext = result;
     *plaintext_length = decrypted_length;
     result = NULL;
-    result_status = VAULT_READ_OK;
+    success = 1;
 
 cleanup:
-    storage_free(serialized);
     if (result != NULL) {
         OPENSSL_clear_free(result,
                            ciphertext_length == 0 ? 1 : ciphertext_length);
     }
+    return success;
+}
+
+static int read_serialized(const struct storage *storage,
+                           const struct account_session *session,
+                           char filename[VAULT_FILENAME_BYTES],
+                           unsigned char **serialized,
+                           size_t *serialized_length)
+{
+    if (!vault_filename(session->user_id, filename)) {
+        errno = EINVAL;
+        return STORAGE_READ_ERROR;
+    }
+    return storage_read_file(storage, STORAGE_AREA_VAULTS, filename,
+                             VAULT_MAX_FILE_BYTES,
+                             serialized, serialized_length);
+}
+
+static int installed_plaintext_matches(
+    const struct storage *storage, const struct account_session *session,
+    const unsigned char *plaintext, size_t plaintext_length)
+{
+    unsigned char *installed = NULL;
+    size_t installed_length = 0;
+    int success = vault_read(storage, session, &installed,
+                             &installed_length) == VAULT_READ_OK &&
+                  installed_length == plaintext_length &&
+                  (plaintext_length == 0 ||
+                   CRYPTO_memcmp(installed, plaintext,
+                                 plaintext_length) == 0);
+
+    vault_secure_free(installed, installed_length);
+    return success;
+}
+
+int vault_write(const struct storage *storage,
+                const struct account_session *session,
+                const unsigned char *plaintext, size_t plaintext_length)
+{
+    unsigned char *serialized = NULL;
+    char filename[VAULT_FILENAME_BYTES];
+    size_t serialized_length = 0;
+    enum storage_atomic_result write_result;
+    int success = 0;
+
+    if (storage == NULL || !valid_session(session) ||
+        !vault_filename(session->user_id, filename) ||
+        !encrypt_serialized(session, plaintext, plaintext_length,
+                            &serialized, &serialized_length)) {
+        goto cleanup;
+    }
+    write_result = storage_atomic_write_result(
+        storage, STORAGE_AREA_VAULTS, filename,
+        serialized, serialized_length);
+    if (write_result == STORAGE_ATOMIC_ERROR) {
+        goto cleanup;
+    }
+    if (write_result == STORAGE_ATOMIC_INSTALLED) {
+        int saved_errno = errno;
+
+        if (!installed_plaintext_matches(storage, session,
+                                         plaintext, plaintext_length)) {
+            errno = saved_errno;
+            goto cleanup;
+        }
+    }
+    success = 1;
+
+cleanup:
+    free(serialized);
+    return success;
+}
+
+int vault_read(const struct storage *storage,
+               const struct account_session *session,
+               unsigned char **plaintext, size_t *plaintext_length)
+{
+    unsigned char *serialized = NULL;
+    char filename[VAULT_FILENAME_BYTES];
+    size_t serialized_length = 0;
+    int read_result;
+    int result_status = VAULT_READ_ERROR;
+
+    if (plaintext == NULL || plaintext_length == NULL) {
+        errno = EINVAL;
+        return VAULT_READ_ERROR;
+    }
+    *plaintext = NULL;
+    *plaintext_length = 0;
+    if (storage == NULL || !valid_session(session)) {
+        errno = EINVAL;
+        return VAULT_READ_ERROR;
+    }
+    read_result = read_serialized(storage, session, filename,
+                                  &serialized, &serialized_length);
+    if (read_result == STORAGE_READ_MISSING) {
+        return VAULT_READ_MISSING;
+    }
+    if (read_result != STORAGE_READ_OK ||
+        !decrypt_serialized(serialized, serialized_length, session,
+                            plaintext, plaintext_length)) {
+        goto cleanup;
+    }
+    result_status = VAULT_READ_OK;
+
+cleanup:
+    storage_free(serialized);
     return result_status;
+}
+
+int vault_verify_current(const struct storage *storage,
+                         const struct account_session *session,
+                         const struct storage_lock *lock,
+                         const unsigned char *expected,
+                         size_t expected_length)
+{
+    unsigned char *plaintext = NULL;
+    size_t plaintext_length = 0;
+    int success = vault_lock_validate(storage, session, lock) &&
+                  vault_read(storage, session, &plaintext,
+                             &plaintext_length) == VAULT_READ_OK &&
+                  plaintext_length == expected_length &&
+                  (expected_length == 0 ||
+                   CRYPTO_memcmp(plaintext, expected, expected_length) == 0) &&
+                  vault_lock_validate(storage, session, lock);
+
+    vault_secure_free(plaintext, plaintext_length);
+    if (!success) {
+        errno = EAGAIN;
+    }
+    return success;
+}
+
+int vault_replace_if_current(const struct storage *storage,
+                             const struct account_session *session,
+                             const struct storage_lock *lock,
+                             const unsigned char *expected,
+                             size_t expected_length,
+                             const unsigned char *plaintext,
+                             size_t plaintext_length)
+{
+    unsigned char *current_serialized = NULL;
+    unsigned char *current_plaintext = NULL;
+    unsigned char *replacement = NULL;
+    char filename[VAULT_FILENAME_BYTES];
+    size_t current_serialized_length = 0;
+    size_t current_plaintext_length = 0;
+    size_t replacement_length = 0;
+    enum storage_atomic_result write_result;
+    int read_result;
+    int success = 0;
+
+    if (storage == NULL || !valid_session(session) ||
+        (expected == NULL && expected_length != 0) ||
+        (plaintext == NULL && plaintext_length != 0) ||
+        expected_length > VAULT_MAX_PLAINTEXT_BYTES ||
+        plaintext_length > VAULT_MAX_PLAINTEXT_BYTES ||
+        !vault_lock_validate(storage, session, lock)) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    read_result = read_serialized(storage, session, filename,
+                                  &current_serialized,
+                                  &current_serialized_length);
+    if (read_result != STORAGE_READ_OK ||
+        !decrypt_serialized(current_serialized, current_serialized_length,
+                            session, &current_plaintext,
+                            &current_plaintext_length) ||
+        current_plaintext_length != expected_length ||
+        (expected_length != 0 &&
+         CRYPTO_memcmp(current_plaintext, expected, expected_length) != 0) ||
+        !vault_lock_validate(storage, session, lock) ||
+        !encrypt_serialized(session, plaintext, plaintext_length,
+                            &replacement, &replacement_length)) {
+        errno = EAGAIN;
+        goto cleanup;
+    }
+    write_result = storage_atomic_replace_result(
+        storage, STORAGE_AREA_VAULTS, filename,
+        current_serialized, current_serialized_length,
+        replacement, replacement_length);
+    if (write_result == STORAGE_ATOMIC_ERROR) {
+        goto cleanup;
+    }
+    if (write_result == STORAGE_ATOMIC_INSTALLED) {
+        int saved_errno = errno;
+
+        if (!installed_plaintext_matches(storage, session,
+                                         plaintext, plaintext_length)) {
+            errno = saved_errno;
+            goto cleanup;
+        }
+    }
+    success = 1;
+
+cleanup:
+    storage_free(current_serialized);
+    vault_secure_free(current_plaintext, current_plaintext_length);
+    free(replacement);
+    return success;
 }
 
 void vault_secure_free(void *plaintext, size_t plaintext_length)

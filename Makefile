@@ -1,9 +1,9 @@
 CC ?= cc
-CFLAGS ?= -Wall -Wextra -Wpedantic -Wformat=2 -Wformat-security
+CFLAGS ?= -fstack-protector-strong -Wall -Wextra -Wpedantic -Wformat=2 -Wformat-security
 PKG_CONFIG ?= pkg-config
 PTY_LIBS ?= $(if $(filter Linux,$(shell uname -s)),-lutil,)
 
-# Prefer pkg-config; Homebrew OpenSSL is outside macOS's default search path.
+# OpenSSL paths
 OPENSSL_PREFIX ?= $(shell command -v brew >/dev/null 2>&1 && brew --prefix openssl@3 2>/dev/null)
 ifneq ($(strip $(OPENSSL_PREFIX)),)
 OPENSSL_CFLAGS = -I$(OPENSSL_PREFIX)/include
@@ -17,13 +17,16 @@ OPENSSL_LIBS ?= -lcrypto
 
 TARGET = securepm
 SRC = src/main.c src/cli.c src/input.c src/crypto.c src/auth.c src/storage.c \
+	src/audit.c src/clipboard.c \
 	src/user_db.c src/account.c src/vault.c src/credentials.c
 OBJ = $(SRC:src/%.c=build/%.o)
 DEP = $(OBJ:.o=.d) build/test_crypto.d build/test_auth.d build/test_storage.d \
 	build/test_user_db.d build/test_account.d build/test_vault.d \
-	build/test_credentials.d build/test_cli.d
+	build/test_credentials.d build/test_cli.d build/test_input.d \
+	build/test_audit.d build/test_access_control.d build/storage_test.d \
+	build/clipboard_test.d build/input_test.d
 
-.PHONY: all clean test check-openssl
+.PHONY: all clean test test-all test-memory test-snapshot test-clipboard test-idle test-session-auth test-audit-hardening test-input-boundaries test-recovery check-openssl
 all: $(TARGET)
 
 $(TARGET): $(OBJ) | check-openssl
@@ -56,8 +59,22 @@ build/test_auth: build/test_auth.o build/auth.o build/crypto.o | check-openssl
 build/test_storage.o: tests/test_storage.c | build check-openssl
 	$(CC) $(CPPFLAGS) -Isrc $(OPENSSL_CFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
 
-build/test_storage: build/test_storage.o build/storage.o | check-openssl
+build/test_storage: build/test_storage.o build/storage_test.o | check-openssl
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+build/test_audit.o: tests/test_audit.c | build check-openssl
+	$(CC) $(CPPFLAGS) -Isrc $(OPENSSL_CFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
+
+build/test_audit: build/test_audit.o build/audit.o build/storage_test.o | check-openssl
+	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+build/test_access_control.o: tests/test_access_control.c | build check-openssl
+	$(CC) $(CPPFLAGS) -Isrc $(OPENSSL_CFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
+
+build/test_access_control: build/test_access_control.o build/credentials.o \
+		build/vault.o build/account.o build/user_db.o build/storage.o \
+		build/auth.o build/crypto.o | check-openssl
+	$(CC) $(LDFLAGS) $^ $(OPENSSL_LIBS) $(LDLIBS) -o $@
 
 build/test_user_db.o: tests/test_user_db.c | build check-openssl
 	$(CC) $(CPPFLAGS) -Isrc $(OPENSSL_CFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
@@ -69,14 +86,17 @@ build/test_user_db: build/test_user_db.o build/user_db.o build/storage.o \
 build/test_account.o: tests/test_account.c | build check-openssl
 	$(CC) $(CPPFLAGS) -Isrc $(OPENSSL_CFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
 
+build/storage_test.o: src/storage.c | build check-openssl
+	$(CC) $(CPPFLAGS) -DSECUREPM_TEST_FAULTS -Isrc $(OPENSSL_CFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
+
 build/test_account: build/test_account.o build/account.o build/user_db.o \
-		build/storage.o build/auth.o build/crypto.o | check-openssl
+		build/storage_test.o build/auth.o build/crypto.o | check-openssl
 	$(CC) $(LDFLAGS) $^ $(OPENSSL_LIBS) $(LDLIBS) -o $@
 
 build/test_vault.o: tests/test_vault.c | build check-openssl
 	$(CC) $(CPPFLAGS) -Isrc $(OPENSSL_CFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
 
-build/test_vault: build/test_vault.o build/vault.o build/storage.o \
+build/test_vault: build/test_vault.o build/vault.o build/storage_test.o \
 		build/crypto.o build/account.o build/user_db.o build/auth.o | check-openssl
 	$(CC) $(LDFLAGS) $^ $(OPENSSL_LIBS) $(LDLIBS) -o $@
 
@@ -94,18 +114,74 @@ build/test_cli.o: tests/test_cli.c | build
 build/test_cli: build/test_cli.o
 	$(CC) $(LDFLAGS) $^ $(PTY_LIBS) $(LDLIBS) -o $@
 
-test: $(TARGET) build/test_crypto build/test_auth build/test_storage \
+build/test_input.o: tests/test_input.c | build check-openssl
+	$(CC) $(CPPFLAGS) -Isrc $(OPENSSL_CFLAGS) $(CFLAGS) -std=c17 -MMD -MP -c $< -o $@
+
+build/test_input: build/test_input.o build/input.o build/clipboard_test.o build/crypto.o | check-openssl
+	$(CC) $(LDFLAGS) $^ $(OPENSSL_LIBS) $(LDLIBS) -o $@
+
+build/clipboard_test.o: src/clipboard.c | build check-openssl
+	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -DSECUREPM_CLIPBOARD_TEST -std=c17 -MMD -MP -c $< -o $@
+
+build/test_clipboard_sink: tests/clipboard_sink.c | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c17 $(LDFLAGS) $< $(LDLIBS) -o $@
+
+build/input_test.o: src/input.c | build check-openssl
+	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -DSECUREPM_INPUT_TEST -std=c17 -MMD -MP -c $< -o $@
+
+build/securepm_test: $(filter-out build/clipboard.o build/input.o,$(OBJ)) build/clipboard_test.o build/input_test.o | check-openssl
+	$(CC) $(LDFLAGS) $^ $(OPENSSL_LIBS) $(LDLIBS) -o $@
+
+test: $(TARGET) build/securepm_test build/test_clipboard_sink build/test_crypto build/test_auth build/test_storage \
 		build/test_user_db build/test_account build/test_vault \
-		build/test_credentials build/test_cli
+		build/test_credentials build/test_cli build/test_input build/test_audit \
+		build/test_access_control
 	sh tests/smoke.sh ./$(TARGET)
+	./build/test_input
 	./build/test_crypto
 	./build/test_auth
 	./build/test_storage
+	./build/test_audit
+	./build/test_access_control
 	./build/test_user_db
 	./build/test_account
 	./build/test_vault
 	./build/test_credentials
-	./build/test_cli ./$(TARGET)
+	./build/test_cli ./build/securepm_test
+
+test-snapshot: build/securepm_test build/test_clipboard_sink
+	python3 tests/test_session_snapshot.py
+
+test-clipboard: build/securepm_test build/test_clipboard_sink
+	python3 -B tests/test_clipboard_expiry.py
+
+test-idle: build/securepm_test build/test_clipboard_sink
+	python3 -B tests/test_idle_timeout.py
+
+test-session-auth: build/securepm_test build/test_clipboard_sink
+	python3 -B tests/test_session_auth.py
+
+build/test_core_limit: src/main.c tests/test_core_limit.c | build
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) -std=c17 $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+test-audit-hardening: build/securepm_test build/test_clipboard_sink build/test_audit build/test_core_limit
+	./build/test_core_limit
+	./build/test_audit
+	python3 -B tests/test_audit_actors.py
+
+test-input-boundaries: build/securepm_test build/test_clipboard_sink
+	python3 -B tests/test_input_boundaries.py
+
+test-recovery: build/test_vault build/securepm_test build/test_clipboard_sink
+	./build/test_vault
+	python3 -B tests/test_recovery_and_throttle.py
+
+# Run all portable automated tests; native clipboard and memory inspection are opt-in.
+test-all: test test-snapshot test-clipboard test-idle test-session-auth \
+          test-audit-hardening test-input-boundaries test-recovery
+
+test-memory: $(TARGET)
+	python3 -B tests/test_memory_lifecycle.py
 
 clean:
 	rm -rf build

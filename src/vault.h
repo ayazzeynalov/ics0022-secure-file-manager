@@ -14,14 +14,30 @@
 #define VAULT_READ_MISSING 0
 #define VAULT_READ_OK 1
 
-/* Writes require an unlocked session. NULL plaintext is accepted only for an
- * explicitly encrypted empty payload. The file is replaced atomically. */
+int vault_lock_acquire(const struct storage *storage,
+                       const struct account_session *session,
+                       struct storage_lock *lock);
+int vault_lock_validate(const struct storage *storage,
+                        const struct account_session *session,
+                        const struct storage_lock *lock);
+
 int vault_write(const struct storage *storage,
                 const struct account_session *session,
                 const unsigned char *plaintext, size_t plaintext_length);
 
-/* Missing vaults are distinct from malformed/authentication failures. Returned
- * plaintext must be released with vault_secure_free() and its returned length. */
+int vault_verify_current(const struct storage *storage,
+                         const struct account_session *session,
+                         const struct storage_lock *lock,
+                         const unsigned char *expected,
+                         size_t expected_length);
+int vault_replace_if_current(const struct storage *storage,
+                             const struct account_session *session,
+                             const struct storage_lock *lock,
+                             const unsigned char *expected,
+                             size_t expected_length,
+                             const unsigned char *plaintext,
+                             size_t plaintext_length);
+
 int vault_read(const struct storage *storage,
                const struct account_session *session,
                unsigned char **plaintext, size_t *plaintext_length);

@@ -9,6 +9,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,13 +17,26 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <membership.h>
+#include <sys/acl.h>
+#endif
 
 #define TEST_PATH_BYTES 4096
 #define TEMP_PREFIX ".securepm.tmp."
 
+void storage_test_pause_atomic_before_replace(int ready_fd, int continue_fd);
+void storage_test_fail_read_once(void);
+void storage_test_interrupt_read_once(void);
+void storage_test_early_eof_once(void);
+void storage_test_partial_read_then_error_once(void);
+void storage_test_after_read_once(void (*hook)(void *), void *context);
+
 static unsigned int checks;
 static unsigned int failures;
+static volatile sig_atomic_t lock_signal;
 
 #define CHECK(condition) do { \
     ++checks; \
@@ -31,6 +45,90 @@ static unsigned int failures;
         ++failures; \
     } \
 } while (0)
+
+static void record_lock_signal(int signal_number)
+{
+    lock_signal = signal_number;
+}
+
+static int read_byte_with_timeout(int descriptor, char *byte,
+                                  int timeout_milliseconds)
+{
+    struct pollfd poll_descriptor;
+    int elapsed = 0;
+
+    poll_descriptor.fd = descriptor;
+    poll_descriptor.events = POLLIN;
+    while (elapsed < timeout_milliseconds) {
+        int interval = timeout_milliseconds - elapsed;
+        int result;
+
+        if (interval > 50) {
+            interval = 50;
+        }
+        poll_descriptor.revents = 0;
+        result = poll(&poll_descriptor, 1, interval);
+        elapsed += interval;
+        if (result > 0) {
+            if ((poll_descriptor.revents & POLLIN) == 0) {
+                return 0;
+            }
+            do {
+                result = (int)read(descriptor, byte, 1);
+            } while (result < 0 && errno == EINTR);
+            return result == 1;
+        }
+        if (result < 0 && errno != EINTR) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static int wait_child_with_timeout(pid_t child, int *status,
+                                   int timeout_milliseconds)
+{
+    int elapsed = 0;
+
+    while (elapsed <= timeout_milliseconds) {
+        pid_t result = waitpid(child, status, WNOHANG);
+
+        if (result == child) {
+            return 1;
+        }
+        if (result < 0 && errno != EINTR) {
+            return 0;
+        }
+        if (elapsed == timeout_milliseconds) {
+            break;
+        }
+        (void)poll(NULL, 0, 10);
+        elapsed += 10;
+    }
+    return 0;
+}
+
+static int terminate_and_reap(pid_t child, int *status)
+{
+    if (child <= 0) {
+        return 0;
+    }
+    (void)kill(child, SIGKILL);
+    return wait_child_with_timeout(child, status, 5000);
+}
+
+static int count_open_descriptors(void)
+{
+    int count = 0;
+
+    for (int descriptor = 0; descriptor < 256; ++descriptor) {
+        errno = 0;
+        if (fcntl(descriptor, F_GETFD) != -1 || errno != EBADF) {
+            ++count;
+        }
+    }
+    return count;
+}
 
 static int make_path(char output[TEST_PATH_BYTES],
                      const char *first, const char *second)
@@ -154,6 +252,98 @@ static void check_mode(const char *path, mode_t expected_mode, int directory)
     CHECK(status.st_uid == geteuid());
 }
 
+#ifdef __APPLE__
+static int set_group_read_acl(const char *path)
+{
+    acl_t acl = acl_init(1);
+    acl_entry_t entry;
+    acl_permset_t permissions;
+    uuid_t group_uuid;
+    int result = 0;
+
+    if (acl == NULL) {
+        return 0;
+    }
+    if (acl_create_entry(&acl, &entry) == 0 &&
+        acl_set_tag_type(entry, ACL_EXTENDED_ALLOW) == 0 &&
+        mbr_gid_to_uuid(getegid(), group_uuid) == 0 &&
+        acl_set_qualifier(entry, &group_uuid) == 0 &&
+        acl_get_permset(entry, &permissions) == 0 &&
+        acl_clear_perms(permissions) == 0 &&
+        acl_add_perm(permissions, ACL_READ_DATA) == 0 &&
+        acl_set_permset(entry, permissions) == 0 &&
+        acl_set_file(path, ACL_TYPE_EXTENDED, acl) == 0) {
+        result = 1;
+    }
+    (void)acl_free(acl);
+    return result;
+}
+
+static int clear_extended_acl(const char *path)
+{
+    acl_t acl = acl_init(0);
+    int result;
+
+    if (acl == NULL) {
+        return 0;
+    }
+    result = acl_set_file(path, ACL_TYPE_EXTENDED, acl) == 0;
+    (void)acl_free(acl);
+    return result;
+}
+
+static void test_extended_acls(const struct storage *storage,
+                               const char *home)
+{
+    static const unsigned char original[] = "acl-protected-data";
+    static const unsigned char replacement[] = "replacement";
+    unsigned char *read_data = NULL;
+    size_t read_length = 99;
+    char root[TEST_PATH_BYTES];
+    char vaults[TEST_PATH_BYTES];
+    char file[TEST_PATH_BYTES];
+    struct stat before;
+    struct stat after;
+
+    CHECK(make_path(root, home, ".securepm"));
+    CHECK(make_path(vaults, root, "vaults"));
+    CHECK(make_path(file, root, "acl.db"));
+    CHECK(storage_atomic_write(storage, STORAGE_AREA_ROOT, "acl.db",
+                               original, sizeof(original) - 1) == 1);
+    CHECK(set_group_read_acl(file));
+    CHECK(lstat(file, &before) == 0 &&
+          (before.st_mode & 07777) == STORAGE_FILE_MODE);
+    CHECK(storage_read_file(storage, STORAGE_AREA_ROOT, "acl.db", 1024,
+                            &read_data, &read_length) == STORAGE_READ_ERROR);
+    CHECK(read_data == NULL && read_length == 0);
+    CHECK(storage_atomic_write(storage, STORAGE_AREA_ROOT, "acl.db",
+                               replacement, sizeof(replacement) - 1) == 0);
+    CHECK(lstat(file, &after) == 0 && after.st_size == before.st_size);
+    CHECK(clear_extended_acl(file));
+    CHECK(storage_read_file(storage, STORAGE_AREA_ROOT, "acl.db", 1024,
+                            &read_data, &read_length) == STORAGE_READ_OK);
+    CHECK(read_length == sizeof(original) - 1 &&
+          memcmp(read_data, original, sizeof(original) - 1) == 0);
+    storage_free(read_data);
+    read_data = NULL;
+    CHECK(storage_remove_file(storage, STORAGE_AREA_ROOT, "acl.db") == 1);
+
+    CHECK(set_group_read_acl(root));
+    CHECK(lstat(root, &before) == 0 &&
+          (before.st_mode & 07777) == STORAGE_DIRECTORY_MODE);
+    CHECK(storage_read_file(storage, STORAGE_AREA_ROOT, "users.db", 1024,
+                            &read_data, &read_length) == STORAGE_READ_ERROR);
+    CHECK(clear_extended_acl(root));
+
+    CHECK(set_group_read_acl(vaults));
+    CHECK(lstat(vaults, &before) == 0 &&
+          (before.st_mode & 07777) == STORAGE_DIRECTORY_MODE);
+    CHECK(storage_atomic_write(storage, STORAGE_AREA_VAULTS, "acl.vault",
+                               original, sizeof(original) - 1) == 0);
+    CHECK(clear_extended_acl(vaults));
+}
+#endif
+
 static void test_directories(const char *home)
 {
     char root[TEST_PATH_BYTES];
@@ -212,6 +402,189 @@ static void test_read_write_and_replace(const struct storage *storage,
     check_mode(vault_path, STORAGE_FILE_MODE, 0);
 }
 
+
+static void test_read_io_error(const struct storage *storage)
+{
+    static const unsigned char payload[] = "read-io-failure-check";
+    unsigned char *contents = NULL;
+    size_t contents_len = 123;
+    int read_result;
+    int read_errno;
+    int created;
+
+    created = storage_atomic_write(
+        storage, STORAGE_AREA_ROOT, "eio-case.db",
+        payload, sizeof(payload) - 1);
+    CHECK(created == 1);
+    if (!created) {
+        return;
+    }
+
+    storage_test_fail_read_once();
+    errno = 0;
+    read_result = storage_read_file(
+        storage, STORAGE_AREA_ROOT, "eio-case.db",
+        1024, &contents, &contents_len);
+    read_errno = errno;
+
+    CHECK(read_result == STORAGE_READ_ERROR);
+    CHECK(read_errno == EIO);
+    CHECK(contents == NULL && contents_len == 0);
+
+    CHECK(storage_read_file(
+        storage, STORAGE_AREA_ROOT, "eio-case.db",
+        1024, &contents, &contents_len) == STORAGE_READ_OK);
+    CHECK(contents != NULL &&
+          contents_len == sizeof(payload) - 1 &&
+          memcmp(contents, payload, sizeof(payload) - 1) == 0);
+
+    storage_free(contents);
+    CHECK(storage_remove_file(
+        storage, STORAGE_AREA_ROOT, "eio-case.db") == 1);
+}
+
+
+static void test_read_fault_scenarios(const struct storage *storage)
+{
+    static const unsigned char payload[] = "read-fault-scenarios";
+    unsigned char *contents = NULL;
+    size_t length = 999;
+    int result;
+    int saved_errno;
+
+    int created = storage_atomic_write(
+        storage, STORAGE_AREA_ROOT, "read-fault.db",
+        payload, sizeof(payload) - 1);
+
+    CHECK(created == 1);
+    if (!created) {
+        return;
+    }
+
+    storage_test_interrupt_read_once();
+
+    result = storage_read_file(
+        storage, STORAGE_AREA_ROOT, "read-fault.db",
+        1024, &contents, &length);
+
+    CHECK(result == STORAGE_READ_OK);
+    CHECK(contents != NULL &&
+          length == sizeof(payload) - 1 &&
+          memcmp(contents, payload, sizeof(payload) - 1) == 0);
+
+    storage_free(contents);
+    contents = NULL;
+    length = 999;
+
+    storage_test_early_eof_once();
+    errno = 0;
+
+    result = storage_read_file(
+        storage, STORAGE_AREA_ROOT, "read-fault.db",
+        1024, &contents, &length);
+
+    saved_errno = errno;
+
+    CHECK(result == STORAGE_READ_ERROR);
+    CHECK(saved_errno == EIO);
+    CHECK(contents == NULL && length == 0);
+
+    storage_test_partial_read_then_error_once();
+    errno = 0;
+
+    result = storage_read_file(
+        storage, STORAGE_AREA_ROOT, "read-fault.db",
+        1024, &contents, &length);
+
+    saved_errno = errno;
+
+    CHECK(result == STORAGE_READ_ERROR);
+    CHECK(saved_errno == EIO);
+    CHECK(contents == NULL && length == 0);
+
+    CHECK(storage_read_file(
+        storage, STORAGE_AREA_ROOT, "read-fault.db",
+        1024, &contents, &length) == STORAGE_READ_OK);
+
+    CHECK(contents != NULL &&
+          length == sizeof(payload) - 1 &&
+          memcmp(contents, payload, sizeof(payload) - 1) == 0);
+
+    storage_free(contents);
+
+    CHECK(storage_remove_file(
+        storage, STORAGE_AREA_ROOT, "read-fault.db") == 1);
+}
+
+
+struct read_growth_context {
+    const char *path;
+    off_t original_size;
+    int changed;
+};
+
+static void grow_file_after_read(void *argument)
+{
+    struct read_growth_context *context = argument;
+
+    context->changed =
+        truncate(context->path, context->original_size + 1) == 0;
+}
+
+static void test_read_size_change(const struct storage *storage,
+                                  const char *home)
+{
+    static const unsigned char payload[] = "size-change-test";
+    char root[TEST_PATH_BYTES];
+    char path[TEST_PATH_BYTES];
+    struct read_growth_context context;
+    unsigned char *contents = NULL;
+    size_t length = 999;
+    int paths_ok;
+    int created;
+    int result;
+    int saved_errno;
+
+    paths_ok = make_path(root, home, ".securepm") &&
+               make_path(path, root, "size-change.db");
+
+    CHECK(paths_ok);
+    if (!paths_ok) {
+        return;
+    }
+
+    created = storage_atomic_write(
+        storage, STORAGE_AREA_ROOT, "size-change.db",
+        payload, sizeof(payload) - 1);
+
+    CHECK(created == 1);
+    if (!created) {
+        return;
+    }
+
+    context.path = path;
+    context.original_size = (off_t)(sizeof(payload) - 1);
+    context.changed = 0;
+
+    storage_test_after_read_once(grow_file_after_read, &context);
+
+    errno = 0;
+    result = storage_read_file(
+        storage, STORAGE_AREA_ROOT, "size-change.db",
+        1024, &contents, &length);
+    saved_errno = errno;
+
+    CHECK(context.changed == 1);
+    CHECK(result == STORAGE_READ_ERROR);
+    CHECK(saved_errno == EIO);
+    CHECK(contents == NULL && length == 0);
+
+    storage_free(contents);
+
+    CHECK(storage_remove_file(
+        storage, STORAGE_AREA_ROOT, "size-change.db") == 1);
+}
+
 static void test_missing_and_names(const struct storage *storage)
 {
     static const unsigned char data[] = "dummy";
@@ -236,6 +609,10 @@ static void test_missing_and_names(const struct storage *storage)
     CHECK(read_data != NULL && read_length == 0);
     storage_free(read_data);
     read_data = NULL;
+    CHECK(storage_remove_file(storage, STORAGE_AREA_ROOT, "empty.db") == 1);
+    CHECK(storage_read_file(storage, STORAGE_AREA_ROOT, "empty.db", 0,
+                            &read_data, &read_length) == STORAGE_READ_MISSING);
+    CHECK(storage_remove_file(storage, STORAGE_AREA_ROOT, "empty.db") == 0);
     CHECK(storage_read_file(storage, STORAGE_AREA_ROOT, "users.db", 1,
                             &read_data, &read_length) == STORAGE_READ_ERROR);
     CHECK(read_data == NULL && read_length == 0);
@@ -296,6 +673,7 @@ static void test_symlink_and_unsafe_objects(const struct storage *storage,
                             &read_data, &read_length) == STORAGE_READ_ERROR);
     CHECK(storage_atomic_write(storage, STORAGE_AREA_ROOT, "link.db",
                                replacement, sizeof(replacement) - 1) == 0);
+    CHECK(storage_remove_file(storage, STORAGE_AREA_ROOT, "link.db") == 0);
     file_fd = open(outside, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     CHECK(file_fd >= 0);
     CHECK(read(file_fd, direct_buffer, sizeof(original) - 1) ==
@@ -365,6 +743,7 @@ static void test_oversized_file(const struct storage *storage, const char *home)
 static void test_failed_write_cleanup(const struct storage *storage,
                                       const char *home)
 {
+    static const unsigned char existing[] = "preserved data";
     static const unsigned char data[] = "failure data";
     struct rlimit original_limit;
     struct rlimit small_limit;
@@ -377,6 +756,8 @@ static void test_failed_write_cleanup(const struct storage *storage,
     int signal_ready;
 
     CHECK(make_path(root, home, ".securepm"));
+    CHECK(storage_atomic_write(storage, STORAGE_AREA_ROOT, "failed.db",
+                               existing, sizeof(existing) - 1) == 1);
     limit_ready = getrlimit(RLIMIT_FSIZE, &original_limit) == 0;
     CHECK(limit_ready);
     ignore_action.sa_handler = SIG_IGN;
@@ -392,9 +773,505 @@ static void test_failed_write_cleanup(const struct storage *storage,
         CHECK(setrlimit(RLIMIT_FSIZE, &original_limit) == 0);
         CHECK(sigaction(SIGXFSZ, &original_action, NULL) == 0);
         CHECK(storage_read_file(storage, STORAGE_AREA_ROOT, "failed.db", 1024,
-                                &read_data, &read_length) == STORAGE_READ_MISSING);
+                                &read_data, &read_length) == STORAGE_READ_OK);
+        CHECK(read_length == sizeof(existing) - 1);
+        if (read_data != NULL && read_length == sizeof(existing) - 1) {
+            CHECK(memcmp(read_data, existing, read_length) == 0);
+        }
+        storage_free(read_data);
         CHECK(!directory_has_temporary_file(root));
     }
+}
+
+static void test_atomic_concurrent_replacement(const struct storage *storage,
+                                               const char *home)
+{
+    static const unsigned char original[] = "original-state";
+    static const unsigned char replacement[] = "intended-state";
+    static const unsigned char attacker[] = "external-state";
+    unsigned char *stored = NULL;
+    size_t stored_length = 0;
+    char root[TEST_PATH_BYTES];
+    char target[TEST_PATH_BYTES];
+    char attacker_path[TEST_PATH_BYTES];
+    int ready_pipe[2] = {-1, -1};
+    int continue_pipe[2] = {-1, -1};
+    int status = 0;
+    int child_reaped = 0;
+    int synchronized = 0;
+    pid_t child = -1;
+    char byte;
+
+    CHECK(make_path(root, home, ".securepm"));
+    CHECK(make_path(target, root, "raced.db"));
+    CHECK(make_path(attacker_path, root, "attacker.db"));
+    CHECK(storage_atomic_write(storage, STORAGE_AREA_ROOT, "raced.db",
+                               original, sizeof(original) - 1) == 1);
+    CHECK(pipe(ready_pipe) == 0);
+    CHECK(pipe(continue_pipe) == 0);
+    if (ready_pipe[0] < 0 || continue_pipe[0] < 0) {
+        for (size_t index = 0; index < 2; ++index) {
+            if (ready_pipe[index] >= 0) {
+                close(ready_pipe[index]);
+            }
+            if (continue_pipe[index] >= 0) {
+                close(continue_pipe[index]);
+            }
+        }
+        return;
+    }
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        int replaced;
+
+        close(ready_pipe[0]);
+        close(continue_pipe[1]);
+        storage_test_pause_atomic_before_replace(ready_pipe[1],
+                                                 continue_pipe[0]);
+        replaced = storage_atomic_replace(
+            storage, STORAGE_AREA_ROOT, "raced.db",
+            original, sizeof(original) - 1,
+            replacement, sizeof(replacement) - 1);
+        close(ready_pipe[1]);
+        close(continue_pipe[0]);
+        _exit(replaced ? 1 : 0);
+    }
+    close(ready_pipe[1]);
+    close(continue_pipe[0]);
+    ready_pipe[1] = -1;
+    continue_pipe[0] = -1;
+    if (child > 0) {
+        synchronized = read_byte_with_timeout(ready_pipe[0], &byte, 5000) &&
+                       byte == 1;
+        CHECK(synchronized);
+        if (synchronized) {
+            CHECK(write_direct(attacker_path, attacker, sizeof(attacker) - 1,
+                               STORAGE_FILE_MODE));
+            CHECK(rename(attacker_path, target) == 0);
+            CHECK(write(continue_pipe[1], "C", 1) == 1);
+        }
+        close(continue_pipe[1]);
+        continue_pipe[1] = -1;
+        child_reaped = wait_child_with_timeout(child, &status, 5000);
+        CHECK(child_reaped);
+        if (!child_reaped) {
+            CHECK(terminate_and_reap(child, &status));
+        }
+        CHECK(child_reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        if (synchronized && child_reaped && WIFEXITED(status) &&
+            WEXITSTATUS(status) == 0) {
+            CHECK(storage_read_file(storage, STORAGE_AREA_ROOT, "raced.db",
+                                    1024, &stored,
+                                    &stored_length) == STORAGE_READ_OK);
+            CHECK(stored_length == sizeof(attacker) - 1 &&
+                  memcmp(stored, attacker, sizeof(attacker) - 1) == 0);
+            storage_free(stored);
+            stored = NULL;
+            CHECK(!directory_has_temporary_file(root));
+            CHECK(storage_atomic_replace(
+                      storage, STORAGE_AREA_ROOT, "raced.db",
+                      attacker, sizeof(attacker) - 1,
+                      replacement, sizeof(replacement) - 1) == 1);
+        }
+    }
+    if (ready_pipe[0] >= 0) {
+        close(ready_pipe[0]);
+    }
+    if (continue_pipe[1] >= 0) {
+        close(continue_pipe[1]);
+    }
+}
+
+static void test_directory_replacement(const struct storage *storage,
+                                       const char *home)
+{
+    static const unsigned char data[] = "binding-data";
+    unsigned char *stored = NULL;
+    size_t stored_length = 0;
+    char root[TEST_PATH_BYTES];
+    char moved_root[TEST_PATH_BYTES];
+    char vaults[TEST_PATH_BYTES];
+    char moved_vaults[TEST_PATH_BYTES];
+    char new_vaults[TEST_PATH_BYTES];
+
+    CHECK(make_path(root, home, ".securepm"));
+    CHECK(make_path(moved_root, home, ".securepm-moved"));
+    CHECK(make_path(vaults, root, "vaults"));
+    CHECK(make_path(moved_vaults, root, "vaults-moved"));
+    CHECK(storage_atomic_write(storage, STORAGE_AREA_VAULTS, "binding.db",
+                               data, sizeof(data) - 1) == 1);
+
+    CHECK(rename(vaults, moved_vaults) == 0);
+    CHECK(mkdir(vaults, STORAGE_DIRECTORY_MODE) == 0);
+    CHECK(storage_read_file(storage, STORAGE_AREA_VAULTS, "binding.db", 1024,
+                            &stored, &stored_length) == STORAGE_READ_ERROR);
+    CHECK(stored == NULL && stored_length == 0);
+    CHECK(rmdir(vaults) == 0);
+    CHECK(rename(moved_vaults, vaults) == 0);
+    CHECK(storage_read_file(storage, STORAGE_AREA_VAULTS, "binding.db", 1024,
+                            &stored, &stored_length) == STORAGE_READ_OK);
+    storage_free(stored);
+    stored = NULL;
+
+    CHECK(rename(root, moved_root) == 0);
+    CHECK(mkdir(root, STORAGE_DIRECTORY_MODE) == 0);
+    CHECK(make_path(new_vaults, root, "vaults"));
+    CHECK(mkdir(new_vaults, STORAGE_DIRECTORY_MODE) == 0);
+    CHECK(storage_read_file(storage, STORAGE_AREA_ROOT, "users.db", 1024,
+                            &stored, &stored_length) == STORAGE_READ_ERROR);
+    CHECK(stored == NULL && stored_length == 0);
+    CHECK(rmdir(new_vaults) == 0);
+    CHECK(rmdir(root) == 0);
+    CHECK(rename(moved_root, root) == 0);
+    CHECK(storage_read_file(storage, STORAGE_AREA_VAULTS, "binding.db", 1024,
+                            &stored, &stored_length) == STORAGE_READ_OK);
+    CHECK(stored_length == sizeof(data) - 1 &&
+          memcmp(stored, data, sizeof(data) - 1) == 0);
+    storage_free(stored);
+}
+
+static void test_descriptor_exhaustion(const struct storage *storage)
+{
+    int status = 0;
+    pid_t child = fork();
+
+    CHECK(child >= 0);
+    if (child == 0) {
+        struct rlimit limit;
+        int descriptors[64];
+        size_t descriptor_count = 0;
+        unsigned char *data = (unsigned char *)1;
+        size_t data_length = 99;
+        int success = 1;
+
+        if (getrlimit(RLIMIT_NOFILE, &limit) != 0 || limit.rlim_cur < 16) {
+            _exit(2);
+        }
+        if (limit.rlim_cur > 32) {
+            limit.rlim_cur = 32;
+        }
+        if (setrlimit(RLIMIT_NOFILE, &limit) != 0) {
+            _exit(2);
+        }
+        while (descriptor_count < sizeof(descriptors) / sizeof(descriptors[0])) {
+            int descriptor = open("/dev/null", O_RDONLY | O_CLOEXEC);
+
+            if (descriptor < 0) {
+                break;
+            }
+            descriptors[descriptor_count++] = descriptor;
+        }
+        success = descriptor_count != 0 && errno == EMFILE &&
+                  storage_read_file(storage, STORAGE_AREA_ROOT, "users.db",
+                                    1024, &data, &data_length) ==
+                      STORAGE_READ_ERROR &&
+                  data == NULL && data_length == 0;
+        for (size_t index = 0; index < descriptor_count; ++index) {
+            close(descriptors[index]);
+        }
+        if (success) {
+            success = storage_read_file(storage, STORAGE_AREA_ROOT, "users.db",
+                                        1024, &data, &data_length) ==
+                          STORAGE_READ_OK;
+        }
+        storage_free(data);
+        _exit(success ? 0 : 1);
+    }
+    if (child > 0) {
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+}
+
+static void test_locking(const struct storage *storage, const char *home)
+{
+    struct storage_lock lock = STORAGE_LOCK_INITIALIZER;
+    char root[TEST_PATH_BYTES];
+    char lock_path[TEST_PATH_BYTES];
+    int ready_pipe[2] = {-1, -1};
+    int acquired_pipe[2] = {-1, -1};
+    struct pollfd poll_descriptor;
+    pid_t child = -1;
+    char byte;
+    int status = 0;
+
+    CHECK(storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                               "concurrent.lock", &lock) == 1);
+    CHECK(storage_lock_is_held(&lock));
+    CHECK(make_path(root, home, ".securepm"));
+    CHECK(make_path(lock_path, root, "concurrent.lock"));
+    check_mode(lock_path, STORAGE_FILE_MODE, 0);
+    CHECK(pipe(ready_pipe) == 0);
+    CHECK(pipe(acquired_pipe) == 0);
+    if (ready_pipe[0] < 0 || acquired_pipe[0] < 0) {
+        storage_lock_release(&lock);
+        return;
+    }
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        struct storage_lock child_lock = STORAGE_LOCK_INITIALIZER;
+
+        close(ready_pipe[0]);
+        close(acquired_pipe[0]);
+        if (write(ready_pipe[1], "R", 1) != 1 ||
+            !storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                                  "concurrent.lock", &child_lock) ||
+            write(acquired_pipe[1], "A", 1) != 1) {
+            _exit(1);
+        }
+        storage_lock_release(&child_lock);
+        _exit(0);
+    }
+    close(ready_pipe[1]);
+    close(acquired_pipe[1]);
+    ready_pipe[1] = -1;
+    acquired_pipe[1] = -1;
+    if (child > 0) {
+        CHECK(read(ready_pipe[0], &byte, 1) == 1 && byte == 'R');
+        poll_descriptor.fd = acquired_pipe[0];
+        poll_descriptor.events = POLLIN;
+        poll_descriptor.revents = 0;
+        CHECK(poll(&poll_descriptor, 1, 200) == 0);
+        storage_lock_release(&lock);
+        CHECK(poll(&poll_descriptor, 1, 5000) == 1);
+        CHECK(read(acquired_pipe[0], &byte, 1) == 1 && byte == 'A');
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    storage_lock_release(&lock);
+    close(ready_pipe[0]);
+    close(acquired_pipe[0]);
+    CHECK(!storage_lock_is_held(&lock));
+}
+
+static void test_unsafe_lock_files(const struct storage *storage,
+                                   const char *home)
+{
+    static const unsigned char data[] = "lock";
+    struct storage_lock lock = STORAGE_LOCK_INITIALIZER;
+    char root[TEST_PATH_BYTES];
+    char outside[TEST_PATH_BYTES];
+    char path[TEST_PATH_BYTES];
+    char alias[TEST_PATH_BYTES];
+
+    CHECK(make_path(root, home, ".securepm"));
+    CHECK(make_path(outside, home, "outside.lock"));
+    CHECK(write_direct(outside, data, sizeof(data) - 1, STORAGE_FILE_MODE));
+
+    CHECK(make_path(path, root, "symlink.lock"));
+    CHECK(symlink("../outside.lock", path) == 0);
+    CHECK(storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                               "symlink.lock", &lock) == 0);
+    CHECK(!storage_lock_is_held(&lock));
+
+    CHECK(make_path(path, root, "permissive.lock"));
+    CHECK(write_direct(path, data, sizeof(data) - 1, 0644));
+    CHECK(storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                               "permissive.lock", &lock) == 0);
+    CHECK(!storage_lock_is_held(&lock));
+
+    CHECK(make_path(path, root, "linked.lock"));
+    CHECK(make_path(alias, root, "linked-alias.lock"));
+    CHECK(write_direct(path, data, sizeof(data) - 1, STORAGE_FILE_MODE));
+    CHECK(link(path, alias) == 0);
+    CHECK(storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                               "linked.lock", &lock) == 0);
+    CHECK(!storage_lock_is_held(&lock));
+}
+
+static void test_replaced_lock_file(const struct storage *storage,
+                                    const char *home)
+{
+    struct storage_lock original = STORAGE_LOCK_INITIALIZER;
+    struct storage_lock replacement = STORAGE_LOCK_INITIALIZER;
+    char root[TEST_PATH_BYTES];
+    char path[TEST_PATH_BYTES];
+
+    CHECK(make_path(root, home, ".securepm"));
+    CHECK(make_path(path, root, "replaced.lock"));
+    CHECK(storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                               "replaced.lock", &original) == 1);
+    CHECK(storage_lock_validate(storage, STORAGE_AREA_ROOT,
+                                "replaced.lock", &original) == 1);
+    CHECK(unlink(path) == 0);
+    CHECK(write_direct(path, NULL, 0, STORAGE_FILE_MODE));
+    CHECK(storage_lock_validate(storage, STORAGE_AREA_ROOT,
+                                "replaced.lock", &original) == 0);
+    CHECK(storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                               "replaced.lock", &replacement) == 1);
+    CHECK(storage_lock_validate(storage, STORAGE_AREA_ROOT,
+                                "replaced.lock", &replacement) == 1);
+    storage_lock_release(&replacement);
+    storage_lock_release(&original);
+}
+
+static void test_lock_cleanup_after_exit(const struct storage *storage)
+{
+    struct storage_lock lock = STORAGE_LOCK_INITIALIZER;
+    int ready_pipe[2] = {-1, -1};
+    char byte;
+    int status = 0;
+    pid_t child;
+
+    CHECK(pipe(ready_pipe) == 0);
+    if (ready_pipe[0] < 0) {
+        return;
+    }
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        struct storage_lock child_lock = STORAGE_LOCK_INITIALIZER;
+
+        close(ready_pipe[0]);
+        if (!storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                                  "exit-cleanup.lock", &child_lock) ||
+            write(ready_pipe[1], "R", 1) != 1) {
+            _exit(1);
+        }
+        _exit(0);
+    }
+    close(ready_pipe[1]);
+    ready_pipe[1] = -1;
+    if (child > 0) {
+        CHECK(read(ready_pipe[0], &byte, 1) == 1 && byte == 'R');
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        CHECK(storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                                   "exit-cleanup.lock", &lock) == 1);
+        CHECK(storage_lock_is_held(&lock));
+    }
+    storage_lock_release(&lock);
+    close(ready_pipe[0]);
+    CHECK(!storage_lock_is_held(&lock));
+}
+
+static void test_interrupted_lock_wait(const struct storage *storage)
+{
+    struct storage_lock parent_lock = STORAGE_LOCK_INITIALIZER;
+    int ready_pipe[2] = {-1, -1};
+    int result_pipe[2] = {-1, -1};
+    struct pollfd result_poll;
+    char byte = 0;
+    int status = 0;
+    pid_t child = -1;
+
+    CHECK(storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                               "interrupt.lock", &parent_lock) == 1);
+    CHECK(pipe(ready_pipe) == 0);
+    CHECK(pipe(result_pipe) == 0);
+    if (!storage_lock_is_held(&parent_lock) || ready_pipe[0] < 0 ||
+        result_pipe[0] < 0) {
+        storage_lock_release(&parent_lock);
+        return;
+    }
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        struct storage_lock child_lock = STORAGE_LOCK_INITIALIZER;
+        struct sigaction action = {0};
+        int descriptors_before;
+        int saved_errno;
+        int success;
+
+        close(ready_pipe[0]);
+        close(result_pipe[0]);
+        lock_signal = 0;
+        action.sa_handler = record_lock_signal;
+        if (sigemptyset(&action.sa_mask) != 0 ||
+            sigaction(SIGTERM, &action, NULL) != 0) {
+            _exit(1);
+        }
+        descriptors_before = count_open_descriptors();
+        if (write(ready_pipe[1], "R", 1) != 1) {
+            _exit(1);
+        }
+        errno = 0;
+        success = !storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                                        "interrupt.lock", &child_lock);
+        saved_errno = errno;
+        success = success && saved_errno == EINTR &&
+                  lock_signal == SIGTERM &&
+                  !storage_lock_is_held(&child_lock) &&
+                  count_open_descriptors() == descriptors_before;
+        storage_lock_release(&child_lock);
+        byte = success ? 'P' : 'F';
+        if (write(result_pipe[1], &byte, 1) != 1) {
+            _exit(1);
+        }
+        _exit(success ? 0 : 1);
+    }
+    close(ready_pipe[1]);
+    close(result_pipe[1]);
+    ready_pipe[1] = -1;
+    result_pipe[1] = -1;
+    if (child > 0) {
+        CHECK(read(ready_pipe[0], &byte, 1) == 1 && byte == 'R');
+        result_poll.fd = result_pipe[0];
+        result_poll.events = POLLIN;
+        result_poll.revents = 0;
+        CHECK(poll(&result_poll, 1, 200) == 0);
+        CHECK(kill(child, SIGTERM) == 0);
+        result_poll.revents = 0;
+        if (poll(&result_poll, 1, 5000) == 1) {
+            CHECK(read(result_pipe[0], &byte, 1) == 1 && byte == 'P');
+        } else {
+            CHECK(0);
+            (void)kill(child, SIGKILL);
+        }
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    storage_lock_release(&parent_lock);
+    close(ready_pipe[0]);
+    close(result_pipe[0]);
+}
+
+
+static void check_rejected_home(const char *path)
+{
+    struct storage probe = STORAGE_INITIALIZER;
+
+    CHECK(setenv("HOME", path, 1) == 0);
+    CHECK(storage_init(&probe) == 0);
+    CHECK(probe.home_fd == -1 && probe.root_fd == -1 &&
+          probe.vaults_fd == -1);
+    storage_close(&probe);
+}
+
+static void test_invalid_home_paths(const char *valid_home)
+{
+    char missing[TEST_PATH_BYTES];
+    char traversal[TEST_PATH_BYTES];
+    char link_path[TEST_PATH_BYTES];
+
+    check_rejected_home("relative-home");
+
+    if (make_path(missing, valid_home, "missing-home-component")) {
+        check_rejected_home(missing);
+    } else {
+        CHECK(0);
+    }
+
+    if (make_path(traversal, valid_home, "..")) {
+        check_rejected_home(traversal);
+    } else {
+        CHECK(0);
+    }
+
+    if (make_path(link_path, valid_home, "linked-home")) {
+        if (symlink(valid_home, link_path) == 0) {
+            check_rejected_home(link_path);
+            CHECK(unlink(link_path) == 0);
+        } else {
+            CHECK(0);
+        }
+    } else {
+        CHECK(0);
+    }
+
+    CHECK(setenv("HOME", valid_home, 1) == 0);
 }
 
 int main(void)
@@ -414,15 +1291,30 @@ int main(void)
         CHECK(remove_tree(home));
         return 1;
     }
+    test_invalid_home_paths(home);
     test_unsafe_storage_root_rejected(home);
     CHECK(storage_init(&storage) == 1);
     if (storage.root_fd >= 0 && storage.vaults_fd >= 0) {
         test_directories(home);
         test_read_write_and_replace(&storage, home);
+        test_read_io_error(&storage);
+        test_read_fault_scenarios(&storage);
+        test_read_size_change(&storage, home);
         test_missing_and_names(&storage);
         test_symlink_and_unsafe_objects(&storage, home);
+#ifdef __APPLE__
+        test_extended_acls(&storage, home);
+#endif
         test_oversized_file(&storage, home);
         test_failed_write_cleanup(&storage, home);
+        test_atomic_concurrent_replacement(&storage, home);
+        test_directory_replacement(&storage, home);
+        test_descriptor_exhaustion(&storage);
+        test_locking(&storage, home);
+        test_unsafe_lock_files(&storage, home);
+        test_replaced_lock_file(&storage, home);
+        test_lock_cleanup_after_exit(&storage);
+        test_interrupted_lock_wait(&storage);
     }
     storage_close(&storage);
     CHECK(remove_tree(home));

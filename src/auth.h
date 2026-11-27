@@ -14,8 +14,6 @@
 #define AUTH_VERIFIER_MESSAGE "securepm:auth-verifier:v1"
 #define AUTH_VMK_AAD_PREFIX "securepm:vmk-wrap"
 
-/* The verifier is HMAC-SHA256(authentication_key,
- * "securepm:auth-verifier:v1"), excluding the terminating NUL. */
 int auth_create_verifier(const unsigned char *authentication_key,
                          size_t authentication_key_length,
                          unsigned char *verifier, size_t verifier_capacity);
@@ -24,10 +22,6 @@ int auth_verify_verifier(const unsigned char *authentication_key,
                          const unsigned char *stored_verifier,
                          size_t stored_verifier_length);
 
-/* Generates a random VMK and wraps it under the KEK. The VMK is returned only
- * for immediate in-memory use; callers must clear it when the vault is locked.
- * All input and output buffers must be distinct. Outputs are published together
- * only after every operation succeeds and are otherwise left untouched. */
 int auth_generate_wrapped_vmk(const unsigned char *kek, size_t kek_length,
                               const unsigned char *user_id, size_t user_id_length,
                               uint32_t format_version,
@@ -37,8 +31,6 @@ int auth_generate_wrapped_vmk(const unsigned char *kek, size_t kek_length,
                               unsigned char *nonce, size_t nonce_capacity,
                               unsigned char *tag, size_t tag_capacity);
 
-/* Releases the VMK only after AES-GCM authenticates the wrapped key and AAD.
- * Failed unwrapping leaves the caller's VMK buffer untouched. */
 int auth_unwrap_vmk(const unsigned char *kek, size_t kek_length,
                     const unsigned char *user_id, size_t user_id_length,
                     uint32_t format_version,

@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <openssl/crypto.h>
 
@@ -212,6 +213,137 @@ static void test_add_find_and_round_trip(void)
     credentials_cleanup(decoded);
     free(collection);
     free(decoded);
+}
+
+static void test_update_and_delete(void)
+{
+    static const unsigned char first_label[] = "first";
+    static const unsigned char first_password[] = "old-secret-value";
+    static const unsigned char second_label[] = "second";
+    static const unsigned char new_label[] = "updated";
+    static const unsigned char new_username[] = "new-user";
+    static const unsigned char new_password[] = {0x00, 'n', 'e', 'w', 0xff};
+    static const unsigned char new_notes[] = "new notes";
+    struct credential_collection *collection = new_collection();
+    unsigned char first_id[CREDENTIALS_RECORD_ID_BYTES];
+    unsigned char second_id[CREDENTIALS_RECORD_ID_BYTES];
+    unsigned char stable_id[CREDENTIALS_RECORD_ID_BYTES];
+    unsigned char missing_id[CREDENTIALS_RECORD_ID_BYTES] = {0};
+    struct credential_collection *before_failed_update = NULL;
+    const struct credential_record *record;
+
+    CHECK(collection != NULL);
+    if (collection == NULL) {
+        return;
+    }
+    CHECK(add_record(collection, first_label, sizeof(first_label) - 1,
+                     NULL, 0, first_password, sizeof(first_password) - 1,
+                     NULL, 0, first_id) == 1);
+    CHECK(add_record(collection, second_label, sizeof(second_label) - 1,
+                     NULL, 0, NULL, 0, NULL, 0, second_id) == 1);
+    memcpy(stable_id, first_id, sizeof(stable_id));
+
+    CHECK(credentials_update(collection, first_id, sizeof(first_id),
+                             new_label, sizeof(new_label) - 1,
+                             new_username, sizeof(new_username) - 1,
+                             new_password, sizeof(new_password),
+                             new_notes, sizeof(new_notes) - 1) == 1);
+    CHECK(collection->count == 2);
+    record = credentials_find(collection, first_id, sizeof(first_id));
+    CHECK(record != NULL);
+    if (record != NULL) {
+        CHECK(memcmp(record->id, stable_id, sizeof(stable_id)) == 0);
+        CHECK(record->label_length == sizeof(new_label) - 1);
+        CHECK(memcmp(record->label, new_label,
+                     sizeof(new_label) - 1) == 0);
+        CHECK(record->username_length == sizeof(new_username) - 1);
+        CHECK(memcmp(record->username, new_username,
+                     sizeof(new_username) - 1) == 0);
+        CHECK(record->password_length == sizeof(new_password));
+        CHECK(memcmp(record->password, new_password,
+                     sizeof(new_password)) == 0);
+        CHECK(record->notes_length == sizeof(new_notes) - 1);
+        CHECK(memcmp(record->notes, new_notes,
+                     sizeof(new_notes) - 1) == 0);
+        CHECK(!contains_bytes((const unsigned char *)record, sizeof(*record),
+                              first_password,
+                              sizeof(first_password) - 1));
+    }
+    CHECK(credentials_update(collection, missing_id, sizeof(missing_id),
+                             new_label, sizeof(new_label) - 1,
+                             NULL, 0, NULL, 0, NULL, 0) == 0);
+    CHECK(credentials_update(collection, first_id, sizeof(first_id) - 1,
+                             new_label, sizeof(new_label) - 1,
+                             NULL, 0, NULL, 0, NULL, 0) == 0);
+    before_failed_update = malloc(sizeof(*before_failed_update));
+    CHECK(before_failed_update != NULL);
+    if (before_failed_update != NULL) {
+        memcpy(before_failed_update, collection, sizeof(*collection));
+    }
+    CHECK(credentials_update(collection, first_id, sizeof(first_id),
+                             NULL, 0, NULL, 0, NULL, 0, NULL, 0) == 0);
+    CHECK(credentials_update(collection, first_id, sizeof(first_id),
+                             new_label, sizeof(new_label) - 1,
+                             NULL, 0, new_password,
+                             CREDENTIALS_PASSWORD_MAX_BYTES + 1U,
+                             NULL, 0) == 0);
+    if (before_failed_update != NULL) {
+        CHECK(memcmp(before_failed_update, collection,
+                     sizeof(*collection)) == 0);
+        credentials_cleanup(before_failed_update);
+        free(before_failed_update);
+    }
+    record = credentials_find(collection, first_id, sizeof(first_id));
+    CHECK(record != NULL && record->password_length == sizeof(new_password));
+
+    CHECK(credentials_delete(collection, first_id, sizeof(first_id)) == 1);
+    CHECK(collection->count == 1);
+    CHECK(credentials_find(collection, first_id, sizeof(first_id)) == NULL);
+    record = credentials_find(collection, second_id, sizeof(second_id));
+    CHECK(record == &collection->records[0]);
+    CHECK(all_zero(&collection->records[1], sizeof(collection->records[1])));
+    CHECK(credentials_delete(collection, first_id, sizeof(first_id)) == 0);
+    CHECK(credentials_delete(collection, second_id, sizeof(second_id) - 1) == 0);
+    CHECK(credentials_delete(NULL, second_id, sizeof(second_id)) == 0);
+    CHECK(credentials_delete(collection, second_id, sizeof(second_id)) == 1);
+    CHECK(collection->count == 0);
+    CHECK(all_zero(&collection->records[0], sizeof(collection->records[0])));
+
+    credentials_cleanup(collection);
+    free(collection);
+}
+
+static void test_collection_isolation(void)
+{
+    static const unsigned char label[] = "isolated";
+    static const unsigned char changed[] = "changed";
+    struct credential_collection *first = new_collection();
+    struct credential_collection *second = new_collection();
+    unsigned char first_id[CREDENTIALS_RECORD_ID_BYTES];
+    unsigned char second_id[CREDENTIALS_RECORD_ID_BYTES];
+
+    CHECK(first != NULL && second != NULL);
+    if (first == NULL || second == NULL) {
+        free(first);
+        free(second);
+        return;
+    }
+    CHECK(add_record(first, label, sizeof(label) - 1,
+                     NULL, 0, NULL, 0, NULL, 0, first_id) == 1);
+    CHECK(add_record(second, label, sizeof(label) - 1,
+                     NULL, 0, NULL, 0, NULL, 0, second_id) == 1);
+    CHECK(credentials_find(second, first_id, sizeof(first_id)) == NULL);
+    CHECK(credentials_update(second, first_id, sizeof(first_id),
+                             changed, sizeof(changed) - 1,
+                             NULL, 0, NULL, 0, NULL, 0) == 0);
+    CHECK(credentials_delete(second, first_id, sizeof(first_id)) == 0);
+    CHECK(second->count == 1);
+    CHECK(credentials_find(second, second_id, sizeof(second_id)) != NULL);
+
+    credentials_cleanup(first);
+    credentials_cleanup(second);
+    free(first);
+    free(second);
 }
 
 static void test_limits_and_invalid_inputs(void)
@@ -520,6 +652,198 @@ static void vault_filename(const unsigned char user_id[USER_DB_USER_ID_BYTES],
     memcpy(filename + position, ".vault", sizeof(".vault"));
 }
 
+static int transfer_byte(int descriptor, char *byte, int writing)
+{
+    ssize_t result;
+
+    do {
+        result = writing ? write(descriptor, byte, 1) :
+                           read(descriptor, byte, 1);
+    } while (result < 0 && errno == EINTR);
+    return result == 1;
+}
+
+static int recover_pending_account(int ready_fd, int start_fd, int done_fd)
+{
+    static const char password[] = "dummy-concurrent-recovery-password";
+    struct storage storage = STORAGE_INITIALIZER;
+    struct storage_lock vault_lock = STORAGE_LOCK_INITIALIZER;
+    struct account_session session = ACCOUNT_SESSION_INITIALIZER;
+    struct credential_collection *collection = new_collection();
+    unsigned char *payload = NULL;
+    unsigned char *serialized = NULL;
+    size_t payload_length = 0;
+    size_t serialized_length = 0;
+    char byte = 'R';
+    int vault_result;
+    int success = collection != NULL && storage_init(&storage) == 1 &&
+                  account_register(&storage, "Concurrent", 10,
+                                   password, sizeof(password) - 1) ==
+                      ACCOUNT_REGISTER_RECOVERY;
+
+    byte = success ? 'R' : 'F';
+    success = transfer_byte(ready_fd, &byte, 1) && success;
+    if (transfer_byte(start_fd, &byte, 0) && success) {
+        success = account_unlock(&storage, "Concurrent", 10,
+                                 password, sizeof(password) - 1,
+                                 &session) == 1 &&
+                  vault_lock_acquire(&storage, &session, &vault_lock) == 1;
+    } else {
+        success = 0;
+    }
+
+    if (success) {
+        vault_result = vault_read(&storage, &session,
+                                  &payload, &payload_length);
+        if (vault_result == VAULT_READ_MISSING) {
+            success = credentials_serialize(collection, &serialized,
+                                            &serialized_length) == 1 &&
+                      vault_write(&storage, &session,
+                                  serialized, serialized_length) == 1;
+        } else if (vault_result == VAULT_READ_OK) {
+            success = credentials_deserialize(payload, payload_length,
+                                              collection) == 1 &&
+                      collection->count == 0;
+        } else {
+            success = 0;
+        }
+    }
+    if (success) {
+        success = account_registration_complete(&storage, &session) == 1;
+    }
+    byte = success ? 'D' : 'F';
+    (void)transfer_byte(done_fd, &byte, 1);
+    vault_secure_free(payload, payload_length);
+    credentials_serialized_free(serialized, serialized_length);
+    if (collection != NULL) {
+        credentials_cleanup(collection);
+        free(collection);
+    }
+    account_session_lock(&session);
+    storage_lock_release(&vault_lock);
+    storage_close(&storage);
+    return success;
+}
+
+static void test_concurrent_registration_recovery(void)
+{
+    static const char password[] = "dummy-concurrent-recovery-password";
+    char home_template[TEST_PATH_BYTES];
+    char filename[TEST_VAULT_FILENAME_BYTES];
+    char *home = make_temporary_home(home_template);
+    struct storage storage = STORAGE_INITIALIZER;
+    struct user_database database;
+    const struct user_record *record;
+    unsigned char *first_vault = NULL;
+    unsigned char *second_vault = NULL;
+    size_t first_length = 0;
+    size_t second_length = 0;
+    int ready_pipe[2] = {-1, -1};
+    int done_pipe[2] = {-1, -1};
+    int start_pipes[2][2] = {{-1, -1}, {-1, -1}};
+    pid_t children[2] = {-1, -1};
+    int statuses[2] = {0, 0};
+    char byte;
+    int home_set;
+
+    CHECK(home != NULL);
+    if (home == NULL) {
+        return;
+    }
+    home_set = setenv("HOME", home, 1) == 0;
+    CHECK(home_set);
+    CHECK(home_set && storage_init(&storage) == 1);
+    CHECK(account_register(&storage, "Concurrent", 10,
+                           password, sizeof(password) - 1) ==
+          ACCOUNT_REGISTER_CREATED);
+    user_db_init(&database);
+    CHECK(user_db_load(&storage, &database) == 1);
+    record = user_db_find_username(&database, "Concurrent", 10);
+    CHECK(record != NULL);
+    if (record != NULL) {
+        vault_filename(record->user_id, filename);
+    }
+    storage_close(&storage);
+
+    CHECK(pipe(ready_pipe) == 0);
+    CHECK(pipe(done_pipe) == 0);
+    CHECK(pipe(start_pipes[0]) == 0);
+    CHECK(pipe(start_pipes[1]) == 0);
+    if (record != NULL && ready_pipe[0] >= 0 && done_pipe[0] >= 0 &&
+        start_pipes[0][0] >= 0 && start_pipes[1][0] >= 0) {
+        for (size_t index = 0; index < 2; ++index) {
+            children[index] = fork();
+            CHECK(children[index] >= 0);
+            if (children[index] == 0) {
+                close(ready_pipe[0]);
+                close(done_pipe[0]);
+                close(start_pipes[index][1]);
+                close(start_pipes[1 - index][0]);
+                close(start_pipes[1 - index][1]);
+                _exit(recover_pending_account(ready_pipe[1],
+                                              start_pipes[index][0],
+                                              done_pipe[1]) ? 0 : 1);
+            }
+        }
+        close(ready_pipe[1]);
+        close(done_pipe[1]);
+        close(start_pipes[0][0]);
+        close(start_pipes[1][0]);
+        ready_pipe[1] = -1;
+        done_pipe[1] = -1;
+        start_pipes[0][0] = -1;
+        start_pipes[1][0] = -1;
+        CHECK(transfer_byte(ready_pipe[0], &byte, 0) && byte == 'R');
+        CHECK(transfer_byte(ready_pipe[0], &byte, 0) && byte == 'R');
+
+        byte = 'S';
+        CHECK(transfer_byte(start_pipes[0][1], &byte, 1));
+        CHECK(transfer_byte(done_pipe[0], &byte, 0) && byte == 'D');
+        CHECK(storage_init(&storage) == 1);
+        CHECK(storage_read_file(&storage, STORAGE_AREA_VAULTS, filename,
+                                STORAGE_MAX_FILE_BYTES, &first_vault,
+                                &first_length) == STORAGE_READ_OK);
+        storage_close(&storage);
+
+        byte = 'S';
+        CHECK(transfer_byte(start_pipes[1][1], &byte, 1));
+        CHECK(transfer_byte(done_pipe[0], &byte, 0) && byte == 'D');
+        CHECK(storage_init(&storage) == 1);
+        CHECK(storage_read_file(&storage, STORAGE_AREA_VAULTS, filename,
+                                STORAGE_MAX_FILE_BYTES, &second_vault,
+                                &second_length) == STORAGE_READ_OK);
+        storage_close(&storage);
+        CHECK(first_length == second_length);
+        if (first_vault != NULL && second_vault != NULL &&
+            first_length == second_length) {
+            CHECK(memcmp(first_vault, second_vault, first_length) == 0);
+        }
+        for (size_t index = 0; index < 2; ++index) {
+            CHECK(waitpid(children[index], &statuses[index], 0) ==
+                  children[index]);
+            CHECK(WIFEXITED(statuses[index]) &&
+                  WEXITSTATUS(statuses[index]) == 0);
+        }
+    }
+    storage_free(first_vault);
+    storage_free(second_vault);
+    storage_close(&storage);
+    for (size_t index = 0; index < 2; ++index) {
+        if (ready_pipe[index] >= 0) {
+            close(ready_pipe[index]);
+        }
+        if (done_pipe[index] >= 0) {
+            close(done_pipe[index]);
+        }
+        for (size_t pipe_index = 0; pipe_index < 2; ++pipe_index) {
+            if (start_pipes[index][pipe_index] >= 0) {
+                close(start_pipes[index][pipe_index]);
+            }
+        }
+    }
+    CHECK(remove_tree(home));
+}
+
 static void test_vault_integration(void)
 {
     static const unsigned char label[] = "integration service";
@@ -531,6 +855,7 @@ static void test_vault_integration(void)
     char filename[TEST_VAULT_FILENAME_BYTES];
     char *home = make_temporary_home(home_template);
     struct storage storage = STORAGE_INITIALIZER;
+    struct storage_lock vault_lock = STORAGE_LOCK_INITIALIZER;
     struct account_session session = ACCOUNT_SESSION_INITIALIZER;
     struct credential_collection *collection = new_collection();
     struct credential_collection *decoded = new_collection();
@@ -538,9 +863,11 @@ static void test_vault_integration(void)
     unsigned char *serialized = NULL;
     unsigned char *decrypted = NULL;
     unsigned char *encrypted_file = NULL;
+    unsigned char *after_recovery = NULL;
     size_t serialized_length = 0;
     size_t decrypted_length = 0;
     size_t encrypted_length = 0;
+    size_t after_recovery_length = 0;
     int home_set;
 
     CHECK(home != NULL && collection != NULL && decoded != NULL);
@@ -577,6 +904,7 @@ static void test_vault_integration(void)
                      notes, sizeof(notes) - 1, record_id) == 1);
     CHECK(credentials_serialize(collection, &serialized,
                                 &serialized_length) == 1);
+    CHECK(vault_lock_acquire(&storage, &session, &vault_lock) == 1);
     CHECK(vault_write(&storage, &session,
                       serialized, serialized_length) == 1);
     vault_filename(session.user_id, filename);
@@ -587,18 +915,22 @@ static void test_vault_integration(void)
                           password, sizeof(password) - 1));
     CHECK(!contains_bytes(encrypted_file, encrypted_length,
                           username, sizeof(username) - 1));
-    storage_free(encrypted_file);
-    encrypted_file = NULL;
     credentials_serialized_free(serialized, serialized_length);
     serialized = NULL;
     serialized_length = 0;
     account_session_lock(&session);
+    storage_lock_release(&vault_lock);
     storage_close(&storage);
 
     CHECK(storage_init(&storage) == 1);
+    CHECK(account_register(&storage, "Integration", 11,
+                           master_password,
+                           sizeof(master_password) - 1) ==
+          ACCOUNT_REGISTER_RECOVERY);
     CHECK(account_unlock(&storage, "Integration", 11,
                          master_password, sizeof(master_password) - 1,
                          &session) == 1);
+    CHECK(vault_lock_acquire(&storage, &session, &vault_lock) == 1);
     CHECK(vault_read(&storage, &session, &decrypted,
                      &decrypted_length) == VAULT_READ_OK);
     CHECK(credentials_deserialize(decrypted, decrypted_length, decoded) == 1);
@@ -613,13 +945,23 @@ static void test_vault_integration(void)
         CHECK(record->notes_length == sizeof(notes) - 1);
         CHECK(memcmp(record->notes, notes, record->notes_length) == 0);
     }
+    CHECK(account_registration_complete(&storage, &session) == 1);
+    CHECK(storage_read_file(&storage, STORAGE_AREA_VAULTS, filename,
+                            STORAGE_MAX_FILE_BYTES, &after_recovery,
+                            &after_recovery_length) == STORAGE_READ_OK);
+    CHECK(after_recovery_length == encrypted_length);
+    if (after_recovery != NULL && after_recovery_length == encrypted_length) {
+        CHECK(memcmp(after_recovery, encrypted_file, encrypted_length) == 0);
+    }
 
     vault_secure_free(decrypted, decrypted_length);
     credentials_serialized_free(serialized, serialized_length);
     storage_free(encrypted_file);
+    storage_free(after_recovery);
     credentials_cleanup(collection);
     credentials_cleanup(decoded);
     account_session_lock(&session);
+    storage_lock_release(&vault_lock);
     storage_close(&storage);
     OPENSSL_cleanse(master_password, sizeof(master_password));
     free(collection);
@@ -631,11 +973,14 @@ int main(void)
 {
     test_empty_collection();
     test_add_find_and_round_trip();
+    test_update_and_delete();
+    test_collection_isolation();
     test_limits_and_invalid_inputs();
     test_record_limit();
     test_malformed_payloads();
     test_secure_cleanup();
     test_vault_integration();
+    test_concurrent_registration_recovery();
 
     if (failures != 0) {
         fprintf(stderr, "FAIL: %u of %u credential checks\n",

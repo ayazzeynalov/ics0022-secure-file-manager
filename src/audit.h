@@ -1,0 +1,35 @@
+#ifndef SECUREPM_AUDIT_H
+#define SECUREPM_AUDIT_H
+
+#include "storage.h"
+
+#define AUDIT_ACTOR_ID_BYTES 16
+#define AUDIT_ARCHIVE_FILENAME "audit.log.1"
+#define AUDIT_LOG_FILENAME "audit.log"
+#define AUDIT_LOG_MAX_BYTES (1024U * 1024U)
+
+enum audit_event {
+    AUDIT_EVENT_USER_REGISTRATION = 0,
+    AUDIT_EVENT_LOGIN,
+    AUDIT_EVENT_VAULT_LOAD,
+    AUDIT_EVENT_CREDENTIAL_CREATE,
+    AUDIT_EVENT_CREDENTIAL_UPDATE,
+    AUDIT_EVENT_CREDENTIAL_DELETE,
+    AUDIT_EVENT_PASSWORD_COPY,
+    AUDIT_EVENT_SESSION_LOCK
+};
+
+enum audit_outcome {
+    AUDIT_OUTCOME_SUCCESS = 0,
+    AUDIT_OUTCOME_FAILURE,
+    AUDIT_OUTCOME_CANCELLED
+};
+
+int audit_log_event(const struct storage *storage, enum audit_event event,
+                    enum audit_outcome outcome);
+
+int audit_log_actor(const struct storage *storage, enum audit_event event,
+                    enum audit_outcome outcome,
+                    const unsigned char actor_id[AUDIT_ACTOR_ID_BYTES]);
+
+#endif

@@ -1,31 +1,114 @@
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#else
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "cli.h"
 
 #include "account.h"
+#include "audit.h"
 #include "credentials.h"
+#include "clipboard.h"
+#include "crypto.h"
 #include "input.h"
 #include "storage.h"
 #include "vault.h"
 
+#include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+
+_Static_assert(USER_DB_USER_ID_BYTES == AUDIT_ACTOR_ID_BYTES, "audit ID size mismatch");
 
 #define MENU_INPUT_BYTES 16
+#define LOGIN_DELAY_BASE_MILLISECONDS 500U
+#define LOGIN_DELAY_MAX_FAILURES 3U
 
 #define ACTION_CONTINUE 0
 #define ACTION_EXIT 1
 #define ACTION_INPUT_END 2
 
+struct login_throttle {
+    unsigned int failures;
+};
+
+static void record_audit_event(const struct storage *storage,
+                               enum audit_event event,
+                               enum audit_outcome outcome,
+                               const unsigned char *actor_id)
+{
+    int saved_errno = errno;
+
+    if (!audit_log_actor(storage, event, outcome, actor_id)) {
+        fputs("Warning: security audit event could not be recorded.\n",
+              stderr);
+    }
+    errno = saved_errno;
+}
+
+static void lock_and_audit(const struct storage *storage,
+                           struct account_session *session)
+{
+    unsigned char actor[USER_DB_USER_ID_BYTES];
+    int was_unlocked = session->unlocked == 1;
+
+    memcpy(actor, session->user_id, sizeof(actor));
+    account_session_lock(session);
+    if (was_unlocked) {
+        record_audit_event(storage, AUDIT_EVENT_SESSION_LOCK,
+                           AUDIT_OUTCOME_SUCCESS, actor);
+    }
+}
+
+static void throttle_login_failure(struct login_throttle *throttle,
+                                   const struct timespec *attempt_start)
+{
+    struct timespec now;
+    struct timespec delay;
+    int64_t remaining_nanoseconds;
+    unsigned int delay_milliseconds;
+
+    if (throttle == NULL) {
+        return;
+    }
+    if (throttle->failures < LOGIN_DELAY_MAX_FAILURES) {
+        ++throttle->failures;
+    }
+    delay_milliseconds = LOGIN_DELAY_BASE_MILLISECONDS <<
+                         (throttle->failures - 1);
+    remaining_nanoseconds = (int64_t)delay_milliseconds * 1000000;
+    if (attempt_start != NULL &&
+        clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+        remaining_nanoseconds -=
+            (int64_t)(now.tv_sec - attempt_start->tv_sec) * 1000000000 +
+            (int64_t)now.tv_nsec - attempt_start->tv_nsec;
+    }
+    if (remaining_nanoseconds <= 0) {
+        return;
+    }
+    delay.tv_sec = (time_t)(remaining_nanoseconds / 1000000000);
+    delay.tv_nsec = (long)(remaining_nanoseconds % 1000000000);
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR &&
+           input_interrupted_signal() == 0) {
+    }
+}
+
 static void print_help(const char *program)
 {
-    printf("Secure Password Manager - Checkpoint 2\n\n");
+    printf("Secure Password Manager\n\n");
     printf("Usage:\n");
     printf("  %s\n", program);
     printf("  %s --help\n\n", program);
     printf("Run without arguments in a terminal to create a user, log in, ");
-    printf("add credentials, or list credential labels and usernames.\n");
+    printf("add, view, update, delete, or list credentials.\n");
     printf("Passwords are read interactively and are never accepted as ");
     printf("command-line arguments.\n");
 }
@@ -58,7 +141,7 @@ static int serialize_and_write(const struct storage *storage,
     size_t payload_length = 0;
     int success = 0;
 
-    if (session == NULL || session->unlocked != 1 ||
+    if (!account_session_revalidate(storage, session) ||
         !credentials_serialize(collection, &payload, &payload_length)) {
         goto cleanup;
     }
@@ -69,18 +152,128 @@ cleanup:
     return success;
 }
 
+static int save_updated_collection(
+    const struct storage *storage, const struct account_session *session,
+    const struct storage_lock *vault_lock,
+    struct credential_collection *collection,
+    const struct credential_collection *updated)
+{
+    unsigned char *expected = NULL;
+    unsigned char *replacement = NULL;
+    size_t expected_length = 0;
+    size_t replacement_length = 0;
+    int success = 0;
+
+    if (!account_session_revalidate(storage, session) ||
+        !credentials_serialize(collection, &expected, &expected_length) ||
+        !credentials_serialize(updated, &replacement, &replacement_length) ||
+        !account_session_revalidate(storage, session) ||
+        !vault_replace_if_current(storage, session, vault_lock,
+                                  expected, expected_length,
+                                  replacement, replacement_length)) {
+        goto cleanup;
+    }
+    credentials_cleanup(collection);
+    memcpy(collection, updated, sizeof(*collection));
+    success = 1;
+
+cleanup:
+    credentials_serialized_free(expected, expected_length);
+    credentials_serialized_free(replacement, replacement_length);
+    return success;
+}
+
+static int verify_current_collection(
+    const struct storage *storage, const struct account_session *session,
+    const struct storage_lock *vault_lock,
+    const struct credential_collection *collection)
+{
+    unsigned char *expected = NULL;
+    size_t expected_length = 0;
+    int success = account_session_revalidate(storage, session) &&
+                  credentials_serialize(collection, &expected,
+                                        &expected_length) &&
+                  vault_verify_current(storage, session, vault_lock,
+                                       expected, expected_length) &&
+                  account_session_revalidate(storage, session);
+
+    credentials_serialized_free(expected, expected_length);
+    return success;
+}
+
+/* A random, independent session key authenticates the expected vault payload.
+ * No credential plaintext is retained while waiting at the vault menu. */
+struct session_snapshot {
+    unsigned char key[CRYPTO_KEY_BYTES];
+    unsigned char tag[32];
+};
+
+static int snapshot_tag(const struct session_snapshot *snapshot,
+                        const unsigned char *payload, size_t length,
+                        unsigned char tag[32])
+{
+    unsigned int tag_length = 0;
+
+    return HMAC(EVP_sha256(), snapshot->key, (int)sizeof(snapshot->key),
+                payload, length, tag, &tag_length) != NULL && tag_length == 32;
+}
+
+static int snapshot_collection(struct session_snapshot *snapshot,
+                               const struct credential_collection *collection)
+{
+    unsigned char *payload = NULL;
+    size_t length = 0;
+    int success = credentials_serialize(collection, &payload, &length) &&
+                  snapshot_tag(snapshot, payload, length, snapshot->tag);
+
+    credentials_serialized_free(payload, length);
+    return success;
+}
+
+static int load_session_collection(
+    const struct storage *storage, const struct account_session *session,
+    const struct storage_lock *lock, const struct session_snapshot *snapshot,
+    struct credential_collection *collection)
+{
+    unsigned char *payload = NULL;
+    size_t length = 0;
+    unsigned char actual[32] = {0};
+    int success = account_session_revalidate(storage, session) &&
+                  vault_lock_validate(storage, session, lock) &&
+                  vault_read(storage, session, &payload, &length) == VAULT_READ_OK &&
+                  snapshot_tag(snapshot, payload, length, actual) &&
+                  CRYPTO_memcmp(actual, snapshot->tag, sizeof(actual)) == 0 &&
+                  credentials_deserialize(payload, length, collection) &&
+                  vault_lock_validate(storage, session, lock) &&
+                  account_session_revalidate(storage, session);
+
+    vault_secure_free(payload, length);
+    OPENSSL_cleanse(actual, sizeof(actual));
+    if (!success) {
+        credentials_cleanup(collection);
+    }
+    return success;
+}
+
 static int register_user(const struct storage *storage)
 {
     char username[USER_DB_USERNAME_MAX_BYTES + 1];
     char password[CRYPTO_PASSWORD_MAX_BYTES + 1];
     char confirmation[CRYPTO_PASSWORD_MAX_BYTES + 1];
     struct account_session session = ACCOUNT_SESSION_INITIALIZER;
+    struct storage_lock vault_lock = STORAGE_LOCK_INITIALIZER;
     struct credential_collection *empty = NULL;
+    unsigned char *existing_payload = NULL;
     size_t username_length = 0;
     size_t password_length = 0;
     size_t confirmation_length = 0;
+    size_t existing_payload_length = 0;
     int read_result;
+    int registration_result;
+    int unlock_result = 0;
+    int vault_result;
     int action = ACTION_CONTINUE;
+    enum audit_outcome audit_outcome = AUDIT_OUTCOME_FAILURE;
 
     memset(password, 0, sizeof(password));
     memset(confirmation, 0, sizeof(confirmation));
@@ -88,18 +281,27 @@ static int register_user(const struct storage *storage)
                              &username_length, 0);
     if (read_result <= 0) {
         action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        if (read_result < 0) {
+            audit_outcome = AUDIT_OUTCOME_CANCELLED;
+        }
         goto cleanup;
     }
     read_result = read_value("Master password: ", password, sizeof(password),
                              &password_length, 1);
     if (read_result <= 0) {
         action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        if (read_result < 0) {
+            audit_outcome = AUDIT_OUTCOME_CANCELLED;
+        }
         goto cleanup;
     }
     read_result = read_value("Confirm master password: ", confirmation,
                              sizeof(confirmation), &confirmation_length, 1);
     if (read_result <= 0) {
         action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        if (read_result < 0) {
+            audit_outcome = AUDIT_OUTCOME_CANCELLED;
+        }
         goto cleanup;
     }
     if (password_length != confirmation_length ||
@@ -109,34 +311,56 @@ static int register_user(const struct storage *storage)
     }
     OPENSSL_cleanse(confirmation, sizeof(confirmation));
     confirmation_length = 0;
-    if (!account_register(storage, username, username_length,
-                          password, password_length)) {
+    registration_result = account_register(storage, username, username_length,
+                                           password, password_length);
+    if (registration_result == ACCOUNT_REGISTER_ERROR) {
         puts("Registration failed.");
         goto cleanup;
     }
     empty = malloc(sizeof(*empty));
     if (empty != NULL) {
         credentials_init(empty);
+        unlock_result = account_unlock(storage, username,
+                                       username_length, password,
+                                       password_length, &session);
     }
-    if (empty == NULL ||
-        !account_unlock(storage, username, username_length,
-                        password, password_length, &session) ||
-        !serialize_and_write(storage, &session, empty)) {
+    OPENSSL_cleanse(password, sizeof(password));
+    password_length = 0;
+    if (empty == NULL || !unlock_result ||
+        !vault_lock_acquire(storage, &session, &vault_lock)) {
+        puts("Account metadata was created, but encrypted vault "
+             "initialization failed. Registration is incomplete.");
+        goto cleanup;
+    }
+    vault_result = vault_read(storage, &session,
+                              &existing_payload, &existing_payload_length);
+    if ((vault_result == VAULT_READ_MISSING &&
+         !serialize_and_write(storage, &session, empty)) ||
+        (vault_result == VAULT_READ_OK &&
+         !credentials_deserialize(existing_payload,
+                                  existing_payload_length, empty)) ||
+        vault_result == VAULT_READ_ERROR ||
+        !account_registration_complete(storage, &session)) {
         puts("Account metadata was created, but encrypted vault "
              "initialization failed. Registration is incomplete.");
         goto cleanup;
     }
     puts("User created.");
+    audit_outcome = AUDIT_OUTCOME_SUCCESS;
 
 cleanup:
     OPENSSL_cleanse(password, sizeof(password));
     OPENSSL_cleanse(confirmation, sizeof(confirmation));
+    record_audit_event(storage, AUDIT_EVENT_USER_REGISTRATION,
+                       audit_outcome, session.unlocked == 1 ? session.user_id : NULL);
     OPENSSL_cleanse(username, sizeof(username));
+    vault_secure_free(existing_payload, existing_payload_length);
     if (empty != NULL) {
         credentials_cleanup(empty);
         free(empty);
     }
     account_session_lock(&session);
+    storage_lock_release(&vault_lock);
     return action;
 }
 
@@ -172,10 +396,56 @@ static void print_safe_field(const unsigned char *field, size_t length)
     }
 }
 
+static int hexadecimal_value(char character)
+{
+    if (character >= '0' && character <= '9') {
+        return character - '0';
+    }
+    if (character >= 'a' && character <= 'f') {
+        return character - 'a' + 10;
+    }
+    if (character >= 'A' && character <= 'F') {
+        return character - 'A' + 10;
+    }
+    return -1;
+}
+
+static int read_record_id(unsigned char record_id[CREDENTIALS_RECORD_ID_BYTES])
+{
+    char encoded[CREDENTIALS_RECORD_ID_BYTES * 2 + 1];
+    size_t encoded_length = 0;
+    int read_result = read_value("Record ID: ", encoded, sizeof(encoded),
+                                 &encoded_length, 0);
+
+    if (read_result <= 0) {
+        OPENSSL_cleanse(encoded, sizeof(encoded));
+        return read_result;
+    }
+    if (encoded_length != CREDENTIALS_RECORD_ID_BYTES * 2) {
+        puts("Invalid record ID.");
+        OPENSSL_cleanse(encoded, sizeof(encoded));
+        return 0;
+    }
+    for (size_t index = 0; index < CREDENTIALS_RECORD_ID_BYTES; ++index) {
+        int high = hexadecimal_value(encoded[index * 2]);
+        int low = hexadecimal_value(encoded[index * 2 + 1]);
+
+        if (high < 0 || low < 0) {
+            puts("Invalid record ID.");
+            OPENSSL_cleanse(record_id, CREDENTIALS_RECORD_ID_BYTES);
+            OPENSSL_cleanse(encoded, sizeof(encoded));
+            return 0;
+        }
+        record_id[index] = (unsigned char)((high << 4) | low);
+    }
+    OPENSSL_cleanse(encoded, sizeof(encoded));
+    return 1;
+}
+
 static void list_credentials(const struct account_session *session,
                              const struct credential_collection *collection)
 {
-    if (session == NULL || session->unlocked != 1 || collection == NULL) {
+    if (!account_session_is_valid(session) || collection == NULL) {
         puts("Vault is locked.");
         return;
     }
@@ -196,8 +466,85 @@ static void list_credentials(const struct account_session *session,
     }
 }
 
+static int view_credential(const struct storage *storage,
+                           const struct account_session *session,
+                           const struct storage_lock *vault_lock,
+                           const struct credential_collection *collection)
+{
+    unsigned char record_id[CREDENTIALS_RECORD_ID_BYTES] = {0};
+    char confirmation[8] = {0};
+    const struct credential_record *record;
+    size_t confirmation_length = 0;
+    int read_result;
+    int action = ACTION_CONTINUE;
+
+    if (!account_session_is_valid(session) || collection == NULL) {
+        puts("Vault is locked.");
+        return action;
+    }
+    read_result = read_record_id(record_id);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        goto cleanup;
+    }
+    record = credentials_find(collection, record_id, sizeof(record_id));
+    if (record == NULL) {
+        puts("Credential not found.");
+        goto cleanup;
+    }
+    if (!account_session_revalidate(storage, session)) {
+        puts("Credential is unavailable.");
+        goto cleanup;
+    }
+    fputs("ID: ", stdout);
+    print_record_id(record->id);
+    fputs("\nLabel: ", stdout);
+    print_safe_field(record->label, record->label_length);
+    fputs("\nUsername: ", stdout);
+    print_safe_field(record->username, record->username_length);
+    fputs("\nNotes: ", stdout);
+    print_safe_field(record->notes, record->notes_length);
+    fputs("\nPassword: hidden\n", stdout);
+    puts("Warning: other applications may read the clipboard. Clear it after use.");
+    if (!input_discard_pending()) {
+        action = input_interrupted_signal() != 0 ? ACTION_INPUT_END :
+                                                   ACTION_CONTINUE;
+        goto cleanup;
+    }
+    read_result = read_value("Type yes to copy password: ", confirmation,
+                             sizeof(confirmation), &confirmation_length, 0);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        goto cleanup;
+    }
+    if (confirmation_length != 3 ||
+        memcmp(confirmation, "yes", 3) != 0) {
+        puts("Password remains hidden.");
+        record_audit_event(storage, AUDIT_EVENT_PASSWORD_COPY,
+                           AUDIT_OUTCOME_CANCELLED, session->user_id);
+        goto cleanup;
+    }
+    if (!verify_current_collection(storage, session, vault_lock, collection) ||
+        !clipboard_copy(record->password, record->password_length)) {
+        puts("Password could not be copied.");
+        record_audit_event(storage, AUDIT_EVENT_PASSWORD_COPY,
+                           AUDIT_OUTCOME_FAILURE, session->user_id);
+        goto cleanup;
+    }
+    puts("Password copied.");
+    puts("Clipboard expires after 30 seconds; locking or exiting clears it sooner if unchanged.");
+    record_audit_event(storage, AUDIT_EVENT_PASSWORD_COPY,
+                       AUDIT_OUTCOME_SUCCESS, session->user_id);
+
+cleanup:
+    OPENSSL_cleanse(record_id, sizeof(record_id));
+    OPENSSL_cleanse(confirmation, sizeof(confirmation));
+    return action;
+}
+
 static int add_credential(const struct storage *storage,
                           const struct account_session *session,
+                          const struct storage_lock *vault_lock,
                           struct credential_collection *collection)
 {
     char label[CREDENTIALS_LABEL_MAX_BYTES + 1];
@@ -212,9 +559,10 @@ static int add_credential(const struct storage *storage,
     size_t notes_length = 0;
     int read_result;
     int action = ACTION_CONTINUE;
+    enum audit_outcome audit_outcome = AUDIT_OUTCOME_FAILURE;
 
     memset(password, 0, sizeof(password));
-    if (session == NULL || session->unlocked != 1) {
+    if (!account_session_is_valid(session)) {
         puts("Vault is locked.");
         goto cleanup;
     }
@@ -222,24 +570,36 @@ static int add_credential(const struct storage *storage,
                              &label_length, 0);
     if (read_result <= 0) {
         action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        if (read_result < 0) {
+            audit_outcome = AUDIT_OUTCOME_CANCELLED;
+        }
         goto cleanup;
     }
     read_result = read_value("Credential username: ", username,
                              sizeof(username), &username_length, 0);
     if (read_result <= 0) {
         action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        if (read_result < 0) {
+            audit_outcome = AUDIT_OUTCOME_CANCELLED;
+        }
         goto cleanup;
     }
     read_result = read_value("Credential password: ", password,
                              sizeof(password), &password_length, 1);
     if (read_result <= 0) {
         action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        if (read_result < 0) {
+            audit_outcome = AUDIT_OUTCOME_CANCELLED;
+        }
         goto cleanup;
     }
     read_result = read_value("Notes (optional): ", notes, sizeof(notes),
                              &notes_length, 0);
     if (read_result <= 0) {
         action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        if (read_result < 0) {
+            audit_outcome = AUDIT_OUTCOME_CANCELLED;
+        }
         goto cleanup;
     }
     updated = malloc(sizeof(*updated));
@@ -259,15 +619,17 @@ static int add_credential(const struct storage *storage,
     }
     OPENSSL_cleanse(password, sizeof(password));
     password_length = 0;
-    if (!serialize_and_write(storage, session, updated)) {
+    if (!save_updated_collection(storage, session, vault_lock,
+                                 collection, updated)) {
         puts("Credential could not be saved.");
         goto cleanup;
     }
-    credentials_cleanup(collection);
-    memcpy(collection, updated, sizeof(*collection));
     puts("Credential added.");
+    audit_outcome = AUDIT_OUTCOME_SUCCESS;
 
 cleanup:
+    record_audit_event(storage, AUDIT_EVENT_CREDENTIAL_CREATE,
+                       audit_outcome, session->user_id);
     OPENSSL_cleanse(password, sizeof(password));
     OPENSSL_cleanse(record_id, sizeof(record_id));
     OPENSSL_cleanse(label, sizeof(label));
@@ -280,21 +642,216 @@ cleanup:
     return action;
 }
 
+static int update_credential(const struct storage *storage,
+                             const struct account_session *session,
+                             const struct storage_lock *vault_lock,
+                             struct credential_collection *collection)
+{
+    unsigned char record_id[CREDENTIALS_RECORD_ID_BYTES] = {0};
+    char label[CREDENTIALS_LABEL_MAX_BYTES + 1];
+    char username[CREDENTIALS_USERNAME_MAX_BYTES + 1];
+    char password[CREDENTIALS_PASSWORD_MAX_BYTES + 1];
+    char notes[CREDENTIALS_NOTES_MAX_BYTES + 1];
+    struct credential_collection *updated = NULL;
+    size_t label_length = 0;
+    size_t username_length = 0;
+    size_t password_length = 0;
+    size_t notes_length = 0;
+    int read_result;
+    int action = ACTION_CONTINUE;
+    enum audit_outcome audit_outcome = AUDIT_OUTCOME_FAILURE;
+
+    memset(password, 0, sizeof(password));
+    if (!account_session_is_valid(session)) {
+        puts("Vault is locked.");
+        goto cleanup;
+    }
+    read_result = read_record_id(record_id);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        if (read_result < 0) {
+            audit_outcome = AUDIT_OUTCOME_CANCELLED;
+        }
+        goto cleanup;
+    }
+    if (credentials_find(collection, record_id, sizeof(record_id)) == NULL) {
+        puts("Credential not found.");
+        goto cleanup;
+    }
+    read_result = read_value("New label: ", label, sizeof(label),
+                             &label_length, 0);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        if (read_result < 0) {
+            audit_outcome = AUDIT_OUTCOME_CANCELLED;
+        }
+        goto cleanup;
+    }
+    read_result = read_value("New credential username: ", username,
+                             sizeof(username), &username_length, 0);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        if (read_result < 0) {
+            audit_outcome = AUDIT_OUTCOME_CANCELLED;
+        }
+        goto cleanup;
+    }
+    read_result = read_value("New credential password: ", password,
+                             sizeof(password), &password_length, 1);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        if (read_result < 0) {
+            audit_outcome = AUDIT_OUTCOME_CANCELLED;
+        }
+        goto cleanup;
+    }
+    read_result = read_value("New notes (optional): ", notes, sizeof(notes),
+                             &notes_length, 0);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        if (read_result < 0) {
+            audit_outcome = AUDIT_OUTCOME_CANCELLED;
+        }
+        goto cleanup;
+    }
+    updated = malloc(sizeof(*updated));
+    if (updated == NULL) {
+        puts("Credential could not be updated.");
+        goto cleanup;
+    }
+    memcpy(updated, collection, sizeof(*updated));
+    if (!credentials_update(updated, record_id, sizeof(record_id),
+                            (const unsigned char *)label, label_length,
+                            (const unsigned char *)username, username_length,
+                            (const unsigned char *)password, password_length,
+                            (const unsigned char *)notes, notes_length)) {
+        puts("Credential could not be updated.");
+        goto cleanup;
+    }
+    OPENSSL_cleanse(password, sizeof(password));
+    password_length = 0;
+    if (!save_updated_collection(storage, session, vault_lock,
+                                 collection, updated)) {
+        puts("Credential could not be updated.");
+        goto cleanup;
+    }
+    puts("Credential updated.");
+    audit_outcome = AUDIT_OUTCOME_SUCCESS;
+
+cleanup:
+    record_audit_event(storage, AUDIT_EVENT_CREDENTIAL_UPDATE,
+                       audit_outcome, session->user_id);
+    OPENSSL_cleanse(record_id, sizeof(record_id));
+    OPENSSL_cleanse(label, sizeof(label));
+    OPENSSL_cleanse(username, sizeof(username));
+    OPENSSL_cleanse(password, sizeof(password));
+    OPENSSL_cleanse(notes, sizeof(notes));
+    if (updated != NULL) {
+        credentials_cleanup(updated);
+        free(updated);
+    }
+    return action;
+}
+
+static int delete_credential(const struct storage *storage,
+                             const struct account_session *session,
+                             const struct storage_lock *vault_lock,
+                             struct credential_collection *collection)
+{
+    unsigned char record_id[CREDENTIALS_RECORD_ID_BYTES] = {0};
+    char confirmation[8];
+    struct credential_collection *updated = NULL;
+    size_t confirmation_length = 0;
+    int read_result;
+    int action = ACTION_CONTINUE;
+    enum audit_outcome audit_outcome = AUDIT_OUTCOME_FAILURE;
+
+    if (!account_session_is_valid(session)) {
+        puts("Vault is locked.");
+        goto cleanup;
+    }
+    read_result = read_record_id(record_id);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        if (read_result < 0) {
+            audit_outcome = AUDIT_OUTCOME_CANCELLED;
+        }
+        goto cleanup;
+    }
+    if (credentials_find(collection, record_id, sizeof(record_id)) == NULL) {
+        puts("Credential not found.");
+        goto cleanup;
+    }
+    if (!input_discard_pending()) {
+        action = input_interrupted_signal() != 0 ? ACTION_INPUT_END :
+                                                   ACTION_CONTINUE;
+        audit_outcome = AUDIT_OUTCOME_CANCELLED;
+        goto cleanup;
+    }
+    read_result = read_value("Type yes to confirm deletion: ", confirmation,
+                             sizeof(confirmation), &confirmation_length, 0);
+    if (read_result <= 0) {
+        action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        if (read_result < 0) {
+            audit_outcome = AUDIT_OUTCOME_CANCELLED;
+        }
+        goto cleanup;
+    }
+    if (confirmation_length != 3 ||
+        memcmp(confirmation, "yes", 3) != 0) {
+        puts("Deletion cancelled.");
+        audit_outcome = AUDIT_OUTCOME_CANCELLED;
+        goto cleanup;
+    }
+    updated = malloc(sizeof(*updated));
+    if (updated == NULL) {
+        puts("Credential could not be deleted.");
+        goto cleanup;
+    }
+    memcpy(updated, collection, sizeof(*updated));
+    if (!credentials_delete(updated, record_id, sizeof(record_id)) ||
+        !save_updated_collection(storage, session, vault_lock,
+                                 collection, updated)) {
+        puts("Credential could not be deleted.");
+        goto cleanup;
+    }
+    puts("Credential deleted.");
+    audit_outcome = AUDIT_OUTCOME_SUCCESS;
+
+cleanup:
+    record_audit_event(storage, AUDIT_EVENT_CREDENTIAL_DELETE,
+                       audit_outcome, session->user_id);
+    OPENSSL_cleanse(record_id, sizeof(record_id));
+    OPENSSL_cleanse(confirmation, sizeof(confirmation));
+    if (updated != NULL) {
+        credentials_cleanup(updated);
+        free(updated);
+    }
+    return action;
+}
+
 static int authenticated_menu(
     const struct storage *storage, struct account_session *session,
-    struct credential_collection *collection)
+    struct storage_lock *vault_lock,
+    struct credential_collection *collection,
+    struct session_snapshot *snapshot)
 {
     char choice[MENU_INPUT_BYTES];
     size_t choice_length;
 
-    while (session->unlocked == 1) {
+    while (account_session_is_valid(session)) {
         int read_result;
+        int action = ACTION_CONTINUE;
+        int snapshot_ok;
 
         puts("\nVault menu:");
         puts("1. Add credential");
         puts("2. List credentials");
-        puts("3. Lock");
-        puts("4. Exit");
+        puts("3. View credential details");
+        puts("4. Update credential");
+        puts("5. Delete credential");
+        puts("6. Lock");
+        puts("7. Exit");
         read_result = read_value("Choice: ", choice, sizeof(choice),
                                  &choice_length, 0);
         if (read_result < 0) {
@@ -303,61 +860,112 @@ static int authenticated_menu(
         if (read_result == 0) {
             continue;
         }
+        if (choice_length == 1 && choice[0] == '6') {
+            lock_and_audit(storage, session);
+            puts("Vault locked.");
+            return ACTION_CONTINUE;
+        }
+        if (choice_length == 1 && choice[0] == '7') {
+            return ACTION_EXIT;
+        }
+        if (!load_session_collection(storage, session, vault_lock,
+                                     snapshot, collection)) {
+            goto vault_unavailable;
+        }
         if (choice_length == 1 && choice[0] == '1') {
-            if (add_credential(storage, session, collection) ==
-                ACTION_INPUT_END) {
-                return ACTION_INPUT_END;
-            }
+            action = add_credential(storage, session, vault_lock, collection);
         } else if (choice_length == 1 && choice[0] == '2') {
             list_credentials(session, collection);
         } else if (choice_length == 1 && choice[0] == '3') {
-            account_session_lock(session);
-            credentials_cleanup(collection);
-            puts("Vault locked.");
-            return ACTION_CONTINUE;
+            action = view_credential(storage, session, vault_lock, collection);
         } else if (choice_length == 1 && choice[0] == '4') {
-            return ACTION_EXIT;
+            action = update_credential(storage, session, vault_lock, collection);
+        } else if (choice_length == 1 && choice[0] == '5') {
+            action = delete_credential(storage, session, vault_lock, collection);
         } else {
             puts("Invalid choice.");
         }
+        /* The collection changes only after a successful vault replacement.
+         * On failed updates this retains the previous expected snapshot. */
+        snapshot_ok = action == ACTION_CONTINUE &&
+                      snapshot_collection(snapshot, collection);
+        credentials_cleanup(collection);
+        if (action != ACTION_CONTINUE) {
+            return action;
+        }
+        if (!snapshot_ok || !account_session_revalidate(storage, session)) {
+            goto vault_unavailable;
+        }
     }
+    return ACTION_CONTINUE;
+
+vault_unavailable:
+    credentials_cleanup(collection);
+    lock_and_audit(storage, session);
+    puts("Vault is unavailable. Session locked.");
     return ACTION_CONTINUE;
 }
 
-static int login_user(const struct storage *storage)
+static int login_user(const struct storage *storage,
+                      struct login_throttle *throttle)
 {
     char username[USER_DB_USERNAME_MAX_BYTES + 1];
     char password[CRYPTO_PASSWORD_MAX_BYTES + 1];
     struct account_session session = ACCOUNT_SESSION_INITIALIZER;
+    struct storage_lock vault_lock = STORAGE_LOCK_INITIALIZER;
     struct credential_collection *collection = NULL;
+    struct session_snapshot snapshot = {{0}, {0}};
     unsigned char *payload = NULL;
     size_t username_length = 0;
     size_t password_length = 0;
     size_t payload_length = 0;
     int read_result;
     int action = ACTION_CONTINUE;
+    enum audit_outcome login_outcome = AUDIT_OUTCOME_FAILURE;
+    int login_event_recorded = 0;
+    int idle_expired = 0;
+    int vault_load_attempted = 0;
+    int vault_load_succeeded = 0;
+    struct timespec attempt_start;
+    int have_attempt_start = 0;
 
     memset(password, 0, sizeof(password));
     read_result = read_value("Username: ", username, sizeof(username),
                              &username_length, 0);
     if (read_result <= 0) {
         action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        if (read_result < 0) {
+            login_outcome = AUDIT_OUTCOME_CANCELLED;
+        }
         goto cleanup;
     }
     read_result = read_value("Master password: ", password, sizeof(password),
                              &password_length, 1);
     if (read_result <= 0) {
         action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
+        if (read_result < 0) {
+            login_outcome = AUDIT_OUTCOME_CANCELLED;
+        }
         goto cleanup;
     }
+    have_attempt_start = clock_gettime(CLOCK_MONOTONIC, &attempt_start) == 0;
     if (!account_unlock(storage, username, username_length,
                         password, password_length, &session)) {
+        OPENSSL_cleanse(password, sizeof(password));
+        password_length = 0;
+        throttle_login_failure(throttle,
+                               have_attempt_start ? &attempt_start : NULL);
         puts("Login failed.");
         goto cleanup;
     }
+    if (throttle != NULL) {
+        throttle->failures = 0;
+    }
     OPENSSL_cleanse(password, sizeof(password));
     password_length = 0;
-    if (vault_read(storage, &session, &payload, &payload_length) !=
+    vault_load_attempted = 1;
+    if (!vault_lock_acquire(storage, &session, &vault_lock) ||
+        vault_read(storage, &session, &payload, &payload_length) !=
         VAULT_READ_OK) {
         puts("Login failed.");
         goto cleanup;
@@ -368,31 +976,61 @@ static int login_user(const struct storage *storage)
         goto cleanup;
     }
     credentials_init(collection);
-    if (!credentials_deserialize(payload, payload_length, collection)) {
+    if (!credentials_deserialize(payload, payload_length, collection) ||
+        !crypto_random(snapshot.key, sizeof(snapshot.key)) ||
+        !snapshot_tag(&snapshot, payload, payload_length, snapshot.tag) ||
+        !vault_lock_validate(storage, &session, &vault_lock) ||
+        !account_session_revalidate(storage, &session)) {
         puts("Login failed.");
         goto cleanup;
     }
+    credentials_cleanup(collection);
     vault_secure_free(payload, payload_length);
     payload = NULL;
     payload_length = 0;
+    vault_load_succeeded = 1;
+    record_audit_event(storage, AUDIT_EVENT_VAULT_LOAD,
+                       AUDIT_OUTCOME_SUCCESS, session.unlocked == 1 ? session.user_id : NULL);
+    login_outcome = AUDIT_OUTCOME_SUCCESS;
+    record_audit_event(storage, AUDIT_EVENT_LOGIN, login_outcome, session.unlocked == 1 ? session.user_id : NULL);
+    login_event_recorded = 1;
     puts("Login successful.");
-    action = authenticated_menu(storage, &session, collection);
+    input_session_begin();
+    action = authenticated_menu(storage, &session, &vault_lock, collection,
+                                &snapshot);
+    idle_expired = input_session_end();
 
 cleanup:
     OPENSSL_cleanse(password, sizeof(password));
+    OPENSSL_cleanse(&snapshot, sizeof(snapshot));
     OPENSSL_cleanse(username, sizeof(username));
     vault_secure_free(payload, payload_length);
     if (collection != NULL) {
         credentials_cleanup(collection);
         free(collection);
     }
-    account_session_lock(&session);
+    if (vault_load_attempted && !vault_load_succeeded) {
+        record_audit_event(storage, AUDIT_EVENT_VAULT_LOAD,
+                           AUDIT_OUTCOME_FAILURE, session.unlocked == 1 ? session.user_id : NULL);
+    }
+    if (!login_event_recorded) {
+        record_audit_event(storage, AUDIT_EVENT_LOGIN, login_outcome, session.unlocked == 1 ? session.user_id : NULL);
+    }
+    lock_and_audit(storage, &session);
+    storage_lock_release(&vault_lock);
+    clipboard_clear();
+    if (idle_expired && input_interrupted_signal() == 0) {
+        puts("Session timed out. Vault locked.");
+        /* Discard an unfinished canonical input line before the login menu. */
+        action = input_discard_pending() ? ACTION_CONTINUE : ACTION_INPUT_END;
+    }
     return action;
 }
 
 static int interactive_run(void)
 {
     struct storage storage = STORAGE_INITIALIZER;
+    struct login_throttle throttle = {0};
     char choice[MENU_INPUT_BYTES];
     size_t choice_length;
     int exit_status = 0;
@@ -428,7 +1066,7 @@ static int interactive_run(void)
         if (choice_length == 1 && choice[0] == '1') {
             action = register_user(&storage);
         } else if (choice_length == 1 && choice[0] == '2') {
-            action = login_user(&storage);
+            action = login_user(&storage, &throttle);
         } else if (choice_length == 1 && choice[0] == '3') {
             break;
         } else {

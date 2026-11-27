@@ -27,8 +27,6 @@ int crypto_random(unsigned char *output, size_t length)
 
 static int valid_scrypt_params(const struct crypto_scrypt_params *params)
 {
-    /* Bound work as well as memory before accepting future stored parameters.
-     * Lower costs are supported for compatibility/testing, not new user records. */
     return params != NULL && params->n >= 2 && params->n <= 32768 &&
            (params->n & (params->n - 1)) == 0 &&
            params->r >= 1 && params->r <= 8 &&
@@ -89,8 +87,6 @@ int crypto_hkdf_sha256(const unsigned char *key, size_t key_length,
         (info == NULL && info_length != 0) || info_length > 1024) {
         goto cleanup;
     }
-    /* OpenSSL's parameter constructors take void *, but derivation only reads
-     * these input buffers. An empty salt follows RFC 5869's default salt rule. */
     OSSL_PARAM parameters[] = {
         OSSL_PARAM_construct_int(OSSL_KDF_PARAM_MODE, &mode),
         OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST, digest, 0),

@@ -42,8 +42,6 @@ static void test_random(void)
     CHECK(crypto_random(NULL, 16) == 0);
     CHECK(crypto_random(buffer.salt, 0) == 0);
     CHECK(crypto_random(buffer.salt, (size_t)INT_MAX + 1) == 0);
-    /* Successful generation is tested without probabilistic assertions about
-     * specific random bytes or claiming to measure entropy. */
     OPENSSL_cleanse(&buffer, sizeof(buffer));
 }
 
@@ -98,7 +96,7 @@ static void test_scrypt(void)
         {32768, 8, UINT64_MAX, CRYPTO_SCRYPT_MAX_MEMORY},
         {32768, 8, 1, 0},
         {32768, 8, 1, UINT64_MAX},
-        {32768, 8, 1, 1} /* Valid policy bounds; OpenSSL rejects insufficient memory. */
+        {32768, 8, 1, 1}
     };
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
         BAD_ROOT(password, sizeof(password) - 1, salt, sizeof(salt), &invalid[i]);
@@ -109,7 +107,6 @@ static void test_scrypt(void)
     CHECK(crypto_derive_root(password, 1, salt, sizeof(salt), &params, second, 31) == 0);
     CHECK(second[0] == 0xa5 && second[31] == 0xa5);
     CHECK(crypto_derive_root(password, 1, salt, sizeof(salt), &params, second, SIZE_MAX) == 0);
-    /* Small costs exercise input boundaries without changing production defaults. */
     params.n = 16;
     params.r = 1;
     char binary_password[] = {'a', '\0', 'b'};
@@ -133,7 +130,6 @@ static void test_scrypt(void)
 
 static void test_hkdf_vectors(void)
 {
-    /* RFC 5869 Appendix A.1: https://www.rfc-editor.org/rfc/rfc5869#appendix-A.1 */
     unsigned char key[22];
     unsigned char salt[13];
     unsigned char info[10];
@@ -147,7 +143,6 @@ static void test_hkdf_vectors(void)
         0x2f,0x2a,0x2d,0x2d,0x0a,0x90,0xcf,0x1a,0x5a,0x4c,0x5d,0xb0,0x2d,0x56,
         0xec,0xc4,0xc5,0xbf,0x34,0x00,0x72,0x08,0xd5,0xb8,0x87,0x18,0x58,0x65
     };
-    /* RFC 5869 Appendix A.3: no salt or info. */
     const unsigned char expected_empty[42] = {
         0x8d,0xa4,0xe7,0x75,0xa5,0x63,0xc1,0x8f,0x71,0x5f,0x80,0x2a,0x06,0x3c,
         0x5a,0x31,0xb8,0xa1,0x1f,0x5c,0x5e,0xe1,0x87,0x9e,0xc3,0x45,0x4e,0x5f,
@@ -183,7 +178,6 @@ static void test_separation(void)
     CHECK(crypto_derive_keys(root, sizeof(root), &second) == 1);
     CHECK(memcmp(&first, &second, sizeof(first)) == 0);
     CHECK(memcmp(first.authentication, first.kek, CRYPTO_KEY_BYTES) != 0);
-    /* Pin the literal contexts and exclude their NUL terminators. */
     CHECK(crypto_hkdf_sha256(root, sizeof(root), NULL, 0,
                             (const unsigned char *)"securepm:v1:auth", 16,
                             expected, sizeof(expected)) == 1);
@@ -224,7 +218,6 @@ static void test_hkdf_errors(void)
     CHECK(crypto_hkdf_sha256(key, 32, NULL, 0, NULL, 0, output, 0) == 0);
     CHECK(crypto_hkdf_sha256(key, 32, NULL, 0, NULL, 0, output, 8161) == 0);
     CHECK(output[0] == 0xa5 && output[31] == 0xa5);
-    /* Force a real provider-fetch failure in this standalone test process. */
     CHECK(EVP_set_default_properties(NULL, "provider=securepm_missing_provider") == 1);
     BAD_HKDF(key, 32, NULL, 0, NULL, 0);
     memset(&separated, 0xa5, sizeof(separated));
@@ -312,7 +305,6 @@ static void test_aes_gcm_empty_plaintext(void)
 
 static void test_aes_gcm_reference_vector(void)
 {
-    /* Published AES-256-GCM known-answer vector: zero key, IV, and plaintext. */
     unsigned char key[CRYPTO_KEY_BYTES] = {0};
     const unsigned char ciphertext[16] = {
         0xce,0xa7,0x40,0x3d,0x4d,0x60,0x6b,0x6e,

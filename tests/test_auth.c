@@ -142,7 +142,6 @@ static void test_vmk_wrap_round_trip_and_aad(void)
                           unwrapped, sizeof(unwrapped)) == 1);
     CHECK(memcmp(unwrapped, fixture.vmk, sizeof(unwrapped)) == 0);
 
-    /* Pin the documented binary AAD encoding independently of auth.c. */
     CHECK(crypto_aes256_gcm_decrypt(fixture.kek, sizeof(fixture.kek),
                                     fixture.wrapped, sizeof(fixture.wrapped),
                                     exact_aad, sizeof(exact_aad),

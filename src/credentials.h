@@ -31,9 +31,6 @@ struct credential_collection {
 
 void credentials_init(struct credential_collection *collection);
 
-/* Label is required. Username, password, and notes may be empty. Every field
- * is an explicit byte string and need not be NUL-terminated. A fresh random
- * stable ID is returned after the record is added successfully. */
 int credentials_add(struct credential_collection *collection,
                     const unsigned char *label, size_t label_length,
                     const unsigned char *username, size_t username_length,
@@ -45,9 +42,18 @@ const struct credential_record *credentials_find(
     const struct credential_collection *collection,
     const unsigned char *record_id, size_t record_id_length);
 
-/* Serialized payloads contain plaintext credential data and are intended only
- * for immediate use with vault_write(). Release them with the exact returned
- * length through credentials_serialized_free(). */
+int credentials_update(struct credential_collection *collection,
+                       const unsigned char *record_id,
+                       size_t record_id_length,
+                       const unsigned char *label, size_t label_length,
+                       const unsigned char *username, size_t username_length,
+                       const unsigned char *password, size_t password_length,
+                       const unsigned char *notes, size_t notes_length);
+
+int credentials_delete(struct credential_collection *collection,
+                       const unsigned char *record_id,
+                       size_t record_id_length);
+
 int credentials_serialize(const struct credential_collection *collection,
                           unsigned char **payload, size_t *payload_length);
 int credentials_deserialize(const unsigned char *payload,
@@ -55,7 +61,6 @@ int credentials_deserialize(const unsigned char *payload,
                             struct credential_collection *collection);
 void credentials_serialized_free(void *payload, size_t payload_length);
 
-/* Clears every record, including passwords, IDs, and field lengths. */
 void credentials_cleanup(struct credential_collection *collection);
 
 #endif
