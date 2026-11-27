@@ -158,7 +158,7 @@ static int line_valid(const char *line, const char *event,
                       const char *outcome)
 {
     static const char prefix[] = "{\"timestamp\":\"";
-    char expected_suffix[96];
+    char expected_suffix[128];
     char timestamp[21];
     int suffix_length;
     size_t prefix_length = sizeof(prefix) - 1;
@@ -173,7 +173,7 @@ static int line_valid(const char *line, const char *event,
         return 0;
     }
     suffix_length = snprintf(expected_suffix, sizeof(expected_suffix),
-                             "\",\"event\":\"%s\",\"outcome\":\"%s\"}",
+                             "\",\"event\":\"%s\",\"outcome\":\"%s\",\"actor_id\":null}",
                              event, outcome);
     return suffix_length >= 0 && (size_t)suffix_length < sizeof(expected_suffix) &&
            strcmp(line + prefix_length + sizeof(timestamp) - 1,
@@ -442,10 +442,19 @@ static void test_resource_bound(const struct storage *storage,
     }
     CHECK(stat(audit_path, &before) == 0);
     CHECK(audit_log_event(storage, AUDIT_EVENT_LOGIN,
-                          AUDIT_OUTCOME_SUCCESS) == 0);
+                          AUDIT_OUTCOME_SUCCESS) == 1);
     CHECK(stat(audit_path, &after) == 0);
     CHECK(before.st_size == (off_t)AUDIT_LOG_MAX_BYTES &&
-          after.st_size == before.st_size);
+          after.st_size > 0 && after.st_size < before.st_size);
+    {
+        unsigned char *archive = NULL;
+        size_t length = 0;
+        CHECK(storage_read_file(storage, STORAGE_AREA_ROOT,
+                                AUDIT_ARCHIVE_FILENAME, AUDIT_LOG_MAX_BYTES,
+                                &archive, &length) == STORAGE_READ_OK);
+        CHECK(length == AUDIT_LOG_MAX_BYTES);
+        storage_free(archive);
+    }
     CHECK(unlink(audit_path) == 0);
 }
 

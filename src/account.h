@@ -17,10 +17,11 @@ struct account_session {
     int unlocked;
     unsigned char user_id[USER_DB_USER_ID_BYTES];
     unsigned char vmk[AUTH_VMK_BYTES];
+    unsigned char record_digest[USER_DB_RECORD_DIGEST_BYTES];
     unsigned char authenticator[ACCOUNT_SESSION_AUTHENTICATOR_BYTES];
 };
 
-#define ACCOUNT_SESSION_INITIALIZER {0, {0}, {0}, {0}}
+#define ACCOUNT_SESSION_INITIALIZER {0, {0}, {0}, {0}, {0}}
 
 int account_register(const struct storage *storage,
                      const char *username, size_t username_length,
@@ -37,5 +38,7 @@ int account_unlock(const struct storage *storage,
 void account_session_lock(struct account_session *session);
 
 int account_session_is_valid(const struct account_session *session);
+int account_session_revalidate(const struct storage *storage,
+                               const struct account_session *session);
 
 #endif

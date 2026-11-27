@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 #include <openssl/crypto.h>
 
@@ -29,6 +30,57 @@ static int secret_terminal_saved;
 static int signal_pipe[2] = {-1, -1};
 static volatile sig_atomic_t signal_pipe_write_fd = -1;
 static int cleanup_registered;
+static int session_timeout_seconds;
+static int session_timed_out;
+static struct timespec prompt_start;
+
+void input_session_begin(void)
+{
+    session_timeout_seconds = 300;
+    session_timed_out = 0;
+#ifdef SECUREPM_INPUT_TEST
+    const char *test_timeout = getenv("SECUREPM_TEST_IDLE_SECONDS");
+    if (test_timeout != NULL && strcmp(test_timeout, "2") == 0) {
+        session_timeout_seconds = 2;
+    }
+#endif
+}
+
+int input_session_end(void)
+{
+    int expired = session_timed_out;
+    session_timeout_seconds = 0;
+    session_timed_out = 0;
+    return expired;
+}
+
+/* Activity is a submitted line, not individual keystrokes. Each
+ * authenticated prompt has a fixed deadline. */
+static int session_poll_timeout(void)
+{
+    struct timespec now;
+    time_t seconds;
+    long milliseconds;
+
+    if (session_timeout_seconds == 0) return -1;
+    if (session_timed_out || clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+        now.tv_sec < prompt_start.tv_sec) {
+        session_timed_out = 1;
+        return 0;
+    }
+    seconds = now.tv_sec - prompt_start.tv_sec;
+    if (seconds > session_timeout_seconds) {
+        session_timed_out = 1;
+        return 0;
+    }
+    milliseconds = (long)(session_timeout_seconds - seconds) * 1000L +
+                   (prompt_start.tv_nsec - now.tv_nsec) / 1000000L;
+    if (milliseconds <= 0) {
+        session_timed_out = 1;
+        return 0;
+    }
+    return (int)milliseconds;
+}
 
 static void handle_signal(int signal_number)
 {
@@ -207,6 +259,9 @@ static int wait_for_input(void)
     descriptors[1].events = POLLIN;
     while (1) {
         int result;
+        int timeout;
+        int clipboard_timeout;
+        int poll_errno = 0;
 
         if (interrupted_signal != 0) {
             return 0;
@@ -214,17 +269,22 @@ static int wait_for_input(void)
         descriptors[0].revents = 0;
         descriptors[1].revents = 0;
         clipboard_service();
-        result = poll(descriptors, 2, clipboard_poll_timeout());
-        if (result < 0) {
-            int saved_errno = errno;
-            clipboard_service();
-            errno = saved_errno;
-        } else {
-            clipboard_service();
+        timeout = session_poll_timeout();
+        if (session_timed_out) return 0;
+        clipboard_timeout = clipboard_poll_timeout();
+        if (clipboard_timeout >= 0 && (timeout < 0 || clipboard_timeout < timeout)) {
+            timeout = clipboard_timeout;
         }
+        result = poll(descriptors, 2, timeout);
+        if (result < 0) {
+            poll_errno = errno;
+        }
+        clipboard_service();
+        if (session_poll_timeout() == 0) return 0;
         if (result == 0) continue;
         if (result < 0) {
-            if (errno == EINTR) {
+            errno = poll_errno;
+            if (poll_errno == EINTR) {
                 if (interrupted_signal != 0) {
                     return 0;
                 }
@@ -250,7 +310,7 @@ static int wait_for_input(void)
 }
 
 static int read_line(const char *prompt, char *buffer, size_t capacity,
-                     size_t *length)
+                     size_t *length, const struct termios *editing)
 {
     size_t used = 0;
     int invalid = 0;
@@ -263,6 +323,11 @@ static int read_line(const char *prompt, char *buffer, size_t capacity,
         return INPUT_READ_ERROR;
     }
     if (interrupted_signal != 0) {
+        return INPUT_READ_INTERRUPTED;
+    }
+    if (session_timeout_seconds != 0 &&
+        clock_gettime(CLOCK_MONOTONIC, &prompt_start) != 0) {
+        session_timed_out = 1;
         return INPUT_READ_INTERRUPTED;
     }
     if (fputs(prompt, stdout) == EOF || fflush(stdout) == EOF) {
@@ -298,6 +363,40 @@ static int read_line(const char *prompt, char *buffer, size_t capacity,
             return interrupted_signal != 0 ? INPUT_READ_INTERRUPTED :
                                              INPUT_READ_ERROR;
         }
+        /* Noncanonical input avoids silent truncation by the terminal's
+         * canonical queue (notably on macOS). Keep the configured editing
+         * characters while letting the kernel deliver interrupt signals. */
+        if (editing != NULL) {
+            if (editing->c_cc[VEOF] != _POSIX_VDISABLE &&
+                byte == editing->c_cc[VEOF]) {
+                clear_input(buffer, capacity, length);
+                return INPUT_READ_EOF;
+            }
+            if (editing->c_cc[VKILL] != _POSIX_VDISABLE &&
+                byte == editing->c_cc[VKILL]) {
+                clear_input(buffer, capacity, length);
+                used = 0;
+                invalid = 0;
+                too_long = 0;
+                received_input = 0;
+                continue;
+            }
+            if (editing->c_cc[VERASE] != _POSIX_VDISABLE &&
+                byte == editing->c_cc[VERASE]) {
+                /* Once oversized or invalid, reject the line unless the
+                 * user explicitly clears it. Remove a UTF-8 code point
+                 * rather than leaving a partial multibyte character. */
+                if (used != 0 && !too_long && !invalid) {
+                    size_t end = used;
+                    do {
+                        --used;
+                    } while (used != 0 &&
+                             ((unsigned char)buffer[used] & 0xc0U) == 0x80U);
+                    OPENSSL_cleanse(buffer + used, end - used);
+                }
+                continue;
+            }
+        }
         received_input = 1;
         if (byte == '\n') {
             break;
@@ -328,14 +427,8 @@ static int read_line(const char *prompt, char *buffer, size_t capacity,
     return INPUT_READ_OK;
 }
 
-int input_read_line(const char *prompt, char *buffer, size_t capacity,
-                    size_t *length)
-{
-    return read_line(prompt, buffer, capacity, length);
-}
-
-int input_read_secret(const char *prompt, char *buffer, size_t capacity,
-                      size_t *length)
+static int read_terminal_line(const char *prompt, char *buffer,
+                              size_t capacity, size_t *length, int secret)
 {
     struct termios hidden;
     int result;
@@ -352,7 +445,12 @@ int input_read_secret(const char *prompt, char *buffer, size_t capacity,
         return INPUT_READ_ERROR;
     }
     hidden = secret_terminal;
-    hidden.c_lflag &= (tcflag_t)~ECHO;
+    hidden.c_lflag &= (tcflag_t)~(ICANON | IEXTEN);
+    if (secret) {
+        hidden.c_lflag &= (tcflag_t)~(ECHO | ECHONL);
+    }
+    hidden.c_cc[VMIN] = 1;
+    hidden.c_cc[VTIME] = 0;
     secret_terminal_fd = STDIN_FILENO;
     secret_terminal_saved = 1;
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &hidden) != 0) {
@@ -360,15 +458,34 @@ int input_read_secret(const char *prompt, char *buffer, size_t capacity,
         secret_terminal_fd = -1;
         return INPUT_READ_ERROR;
     }
-    result = read_line(prompt, buffer, capacity, length);
+    result = read_line(prompt, buffer, capacity, length, &secret_terminal);
     restore_result = restore_secret_terminal();
-    (void)fputc('\n', stdout);
-    (void)fflush(stdout);
+    if (secret || result == INPUT_READ_EOF || result == INPUT_READ_INTERRUPTED) {
+        (void)fputc('\n', stdout);
+        (void)fflush(stdout);
+    }
     if (!restore_result && result == INPUT_READ_OK) {
         clear_input(buffer, capacity, length);
         return INPUT_READ_ERROR;
     }
     return result;
+}
+
+int input_read_line(const char *prompt, char *buffer, size_t capacity,
+                    size_t *length)
+{
+    /* Long public fields (notes) need the same untruncated byte input as
+     * passwords. Short public fields retain normal terminal line editing. */
+    if (capacity > 1024 && isatty(STDIN_FILENO)) {
+        return read_terminal_line(prompt, buffer, capacity, length, 0);
+    }
+    return read_line(prompt, buffer, capacity, length, NULL);
+}
+
+int input_read_secret(const char *prompt, char *buffer, size_t capacity,
+                      size_t *length)
+{
+    return read_terminal_line(prompt, buffer, capacity, length, 1);
 }
 
 int input_discard_pending(void)

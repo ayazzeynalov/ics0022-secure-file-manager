@@ -3,6 +3,8 @@
 
 #include "storage.h"
 
+#define AUDIT_ACTOR_ID_BYTES 16
+#define AUDIT_ARCHIVE_FILENAME "audit.log.1"
 #define AUDIT_LOG_FILENAME "audit.log"
 #define AUDIT_LOG_MAX_BYTES (1024U * 1024U)
 
@@ -25,5 +27,9 @@ enum audit_outcome {
 
 int audit_log_event(const struct storage *storage, enum audit_event event,
                     enum audit_outcome outcome);
+
+int audit_log_actor(const struct storage *storage, enum audit_event event,
+                    enum audit_outcome outcome,
+                    const unsigned char actor_id[AUDIT_ACTOR_ID_BYTES]);
 
 #endif

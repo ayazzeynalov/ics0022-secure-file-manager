@@ -12,6 +12,8 @@
 
 int input_initialize(void);
 void input_cleanup(void);
+void input_session_begin(void);
+int input_session_end(void);
 
 int input_read_line(const char *prompt, char *buffer, size_t capacity,
                     size_t *length);

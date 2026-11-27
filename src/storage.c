@@ -42,6 +42,7 @@ static int sync_directory(int directory_fd)
 #ifdef SECUREPM_TEST_FAULTS
 static unsigned int atomic_sync_failure_countdown;
 static int atomic_precommit_failure_once;
+static int atomic_enospc_stage;
 static unsigned int append_failure_countdown;
 static int append_interrupt_once;
 static size_t append_write_limit_once;
@@ -86,6 +87,11 @@ void storage_test_fail_read_once(void)
 void storage_test_fail_atomic_sync_after(unsigned int writes)
 {
     atomic_sync_failure_countdown = writes;
+}
+
+void storage_test_partial_write_then_enospc_once(void)
+{
+    atomic_enospc_stage = 1;
 }
 
 void storage_test_fail_atomic_precommit_once(void)
@@ -693,7 +699,22 @@ static int write_all(int file_fd, const unsigned char *data, size_t data_length)
     size_t offset = 0;
 
     while (offset < data_length) {
-        ssize_t count = write(file_fd, data + offset, data_length - offset);
+        ssize_t count;
+#ifdef SECUREPM_TEST_FAULTS
+        if (atomic_enospc_stage == 1) {
+            count = write(file_fd, data + offset, 1);
+            if (count == 1) {
+                atomic_enospc_stage = 2;
+            }
+        } else if (atomic_enospc_stage == 2) {
+            atomic_enospc_stage = 0;
+            errno = ENOSPC;
+            count = -1;
+        } else
+#endif
+        {
+            count = write(file_fd, data + offset, data_length - offset);
+        }
         if (count > 0) {
             offset += (size_t)count;
         } else if (count == 0) {

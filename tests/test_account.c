@@ -165,6 +165,7 @@ static void check_locked(const struct account_session *session)
     CHECK(session->unlocked == 0);
     CHECK(all_zero(session->user_id, sizeof(session->user_id)));
     CHECK(all_zero(session->vmk, sizeof(session->vmk)));
+    CHECK(all_zero(session->record_digest, sizeof(session->record_digest)));
     CHECK(all_zero(session->authenticator, sizeof(session->authenticator)));
     CHECK(account_session_is_valid(session) == 0);
 }
@@ -505,6 +506,9 @@ static void test_session_authenticator(
     CHECK(account_session_is_valid(&modified) == 0);
     modified = *session;
     modified.vmk[0] ^= 1;
+    CHECK(account_session_is_valid(&modified) == 0);
+    modified = *session;
+    modified.record_digest[0] ^= 1;
     CHECK(account_session_is_valid(&modified) == 0);
     modified = *session;
     modified.authenticator[0] ^= 1;

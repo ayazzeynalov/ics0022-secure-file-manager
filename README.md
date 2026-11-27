@@ -12,15 +12,12 @@ The application supports user authentication, encrypted credential
 storage, credential management, per-user access control, and
 structured security logging.
 
-The final implementation passed 3,674 automated checks on macOS and
-3,652 on Linux x86-64 (GCC 14.2, OpenSSL 3.5.5); platform-specific ACL
-tests account for the difference. Ten additional session snapshot checks
-passed on both platforms. On Linux the full suite and snapshot tests also
-passed under Clang 17 AddressSanitizer and UndefinedBehaviorSanitizer.
-Clang Static Analyzer reported no diagnostics in the 12 production C files,
-and credential-parser fuzzing completed 10,000 runs without a crash.
-The production clipboard was tested on macOS; Linux clipboard integration
-was tested with an isolated test backend, not a graphical session.
+The macOS build with OpenSSL 3.5.9 passed 3,705 functional checks and
+3,042 checks in a separate Clang IntegerSanitizer run. Additional regression
+suites cover rollback, clipboard expiration, session timeout, authentication
+revalidation, audit rotation, input boundaries and recovery. The production
+clipboard was tested on macOS; Linux automated tests use an isolated test
+backend, not a graphical session.
 
 The remaining limitations are documented below.
 
@@ -136,7 +133,7 @@ active session; rollback across separate logins is not prevented.
 Application accounts are isolated by authentication, session state, separate
 Vault Master Keys, and separate encrypted vault files. Successful login unwraps
 only the selected account's VMK and issues an in-process session capability
-cryptographically bound to that account's user ID and VMK. Vault and CLI entry
+cryptographically bound to that account's user ID, VMK and record digest. Vault and CLI entry
 points reject locked, modified, or fabricated session structures; locking or a
 failed subsequent login clears the user ID, VMK, and capability.
 
@@ -171,7 +168,7 @@ Security events are appended to `~/.securepm/audit.log` as one JSON object per
 line. Records have a fixed schema and use UTC RFC 3339 timestamps:
 
 ```json
-{"timestamp":"2026-10-29T12:34:56Z","event":"login","outcome":"success"}
+{"timestamp":"2026-10-29T12:34:56Z","event":"login","outcome":"success","actor_id":"00112233445566778899aabbccddeeff"}
 ```
 
 Event names are fixed in the program and cover user registration, login, vault
@@ -179,27 +176,21 @@ load, credential creation/update/deletion, password copy attempts with recorded 
 `cancelled`. A modifying operation is recorded as successful only after the
 encrypted vault has been durably replaced.
 
-Audit records deliberately contain no user or account identifier, password,
-key, VMK, label, credential username, notes, record ID, verifier, salt,
-encrypted material, or other caller-controlled text. This prevents untrusted
-input from changing the JSON structure and minimizes disclosure if the log is
-read. The tradeoff is that events cannot be correlated to a particular account
-when multiple local accounts are active.
+Audit records contain an internal random 128-bit account ID encoded as hex
+for authenticated actions, or JSON `null` when no identity was authenticated.
+They do not contain usernames, passwords, keys, credential fields, verifier,
+salt or arbitrary caller-controlled text. The identifier allows correlation of
+an account's activity without exposing its username.
 
-The log and its stable append lock use mode `0600` inside the existing `0700`
-storage directory. Append opens reject symlinks, non-regular files, unexpected
-ownership or mode, and files with multiple hard links. A per-file advisory lock
-serializes processes; writes use `O_APPEND`, retry interruptions, handle short
-writes, synchronize completed records, and stop before the log exceeds 1 MiB.
-
-Audit logging is best effort for this educational local application. If an
-event cannot be recorded, the CLI prints a generic warning but does not change,
-roll back, or overwrite the result or error state of the primary authentication
-or vault operation. The log has no automatic rotation: after the 1 MiB bound is
-reached, events fail visibly until the user securely archives or removes the
-log. The log is not cryptographically authenticated or tamper-evident, and a
-crash or power loss can leave an incomplete final line despite runtime handling
-of ordinary partial-write errors.
+The log and its stable locks use mode `0600` in the private `0700` directory.
+Append rejects unsafe files and uses synchronized, bounded writes. An outer
+advisory lock serializes append and rotation between cooperating instances.
+At the 1 MiB limit, the previous log is durably copied to `audit.log.1` before
+atomically replacing the current log with the new event. Only one archive is
+retained: at most 2 MiB of completed log files, excluding temporary writes.
+An interrupted rotation can leave duplicate history; external modifications,
+unsafe files or I/O errors can prevent rotation. Audit failures produce a
+warning without undoing the primary operation. Logs are not tamper-evident.
 
 ## Security decisions
 
@@ -241,8 +232,8 @@ of ordinary partial-write errors.
   the lock descriptor must still identify the file at the expected pathname.
   Atomic replacement also verifies that the destination has not changed while
   the temporary file is written.
-- **Audit/error handling:** fixed-enum JSON Lines events contain no identifiers
-  or sensitive fields. Audit append failures produce a generic warning without
+- **Audit/error handling:** fixed-enum JSON Lines events contain a pseudonymous actor ID
+  when authenticated, but no usernames or secret fields. Audit append failures produce a generic warning without
   changing the primary operation, while authentication and vault-load failures
   retain generic user-facing messages.
 - **Registration recovery:** a pending marker allows an interrupted account
@@ -263,7 +254,7 @@ On macOS with Homebrew:
 
 ```bash
 xcode-select --install  # if Command Line Tools are not installed
-brew install openssl@3 pkg-config
+brew install openssl@3.5 pkg-config
 ```
 
 On Debian or Ubuntu with OpenSSL 3.x packages:
@@ -299,9 +290,8 @@ make OPENSSL_CFLAGS='-I/opt/openssl/include' \
 ```
 
 For Linux graphical clipboard retrieval, install `wl-clipboard` on Wayland or
-`xclip` on X11 as appropriate. Python 3 is needed only for the additional
-session snapshot regression test. The Linux results above cover command-line
-build and automated tests, not the native graphical clipboard.
+`xclip` on X11 as appropriate. Python 3 is needed for additional integration tests. Linux automated tests
+cover command-line behavior, not the native graphical clipboard.
 
 ## Tests
 
@@ -322,11 +312,18 @@ build and automated tests, not the native graphical clipboard.
   restoration, queued confirmation input, failed credential persistence, audit
   event coverage, log injection resistance, and audit-write failure handling.
 
-Run the additional session rollback regression tests from the repository root:
+Run the complete portable regression suite from the repository root:
 
 ```bash
-make test-snapshot
+make test-all
 ```
+
+On Linux, `make test-memory` optionally inspects only the test child process
+heap and stack for a randomly generated dummy credential. It first verifies
+that the marker can be observed while an operation is pending, then checks
+that it is absent after adding, listing and locking. No raw memory is saved.
+The experiment requires permission to read the child via `/proc`; it is not
+a proof of erasure from all mappings or other processes.
 
 For a Clang sanitizer build on Linux:
 
@@ -366,10 +363,14 @@ while waiting for input; blocking operations can delay it. There is no password
 generator. The test backend is built separately and is
 not part of the production executable.
 
-The audit log intentionally has no account identifiers, tamper-evident chain,
-automatic rotation, or protection against modification by the same operating
-system account. Its 1 MiB bound limits resource consumption but requires manual
-archival or removal when full.
+Audit logs use pseudonymous account IDs and bounded rotation but are not
+cryptographically authenticated. The same OS account can modify or delete
+logs; older archives are intentionally discarded when rotating.
+
+At startup the application sets both soft and hard `RLIMIT_CORE` to zero
+and refuses to start if that fails. This reduces ordinary core-file exposure,
+not privileged debugger access, OS-specific crash reporting or piped Linux
+core handlers.
 
 Per-user cryptographic authentication rejects a substituted vault, but cannot
 prevent the same OS user from deleting a vault or rolling back both account
@@ -401,10 +402,27 @@ security boundary against a malicious process running as the same OS user.
 Such a process can continuously race pathname checks, replace files immediately
 after validation, or stop the password manager between validation and rename.
 Preventing that class of attack requires a stronger OS privilege boundary or a
-trusted external storage service. Removing `users.db` does not revoke an
-already-issued in-process session capability; the current session can continue
-only while its vault and lock remain valid, and new logins fail closed until the
-database is safely restored.
+trusted external storage service. The CLI revalidates the authenticated account record from `users.db` before
+credential operations, before copying or committing changes, and after each
+operation. The session capability binds a SHA-256 digest of the canonical
+account record to the user ID and VMK. Missing, malformed or changed account
+metadata causes rejection and session locking when detected. Registration of
+another account does not invalidate an unchanged account record. This is
+operation-boundary validation, not continuous monitoring or an atomic transaction
+across both files; transient changes between checks may not be detected.
+
+Authenticated prompts have a five-minute deadline measured with a monotonic
+clock. Submitting a line (not individual
+keystrokes) advances to the next prompt. Passwords and long notes use
+noncanonical terminal input to avoid the OS canonical line length limit.
+Backspace and line kill are handled by the reader; an oversized line must
+be cleared or submitted and rejected. EOF cancels these prompts. Password
+echo stays disabled. For long notes the terminal may display editing keys
+differently than in canonical mode. Timeout cancels an unfinished operation,
+clears the session and clipboard (best effort), releases the vault lock and returns
+to the login menu. This is not a hard deadline during computation, a blocked
+system call or process suspension. Run `make test-idle` for an accelerated
+integration test; the two-second override is available only in the test binary.
 
 Clipboard lifecycle regression: `make test-clipboard` (isolated dummy clipboard,
 2-second test-only expiry; production uses 30 seconds).
@@ -412,3 +430,42 @@ On macOS, optionally verify the native clipboard using
 `python3 -B tests/test_clipboard_macos.py --overwrite-clipboard` after building.
 This deliberately replaces the current clipboard with dummy data; do not use
 it while the test runs. No real vault is used.
+
+### Additional recovery checks
+
+`make test-recovery` injects a partial temporary-file write followed by
+`ENOSPC` in the test build only, measures twenty invalid login attempts and
+checks recovery from a matching backup of `users.db` and the encrypted vault.
+No actual disk is filled. Backups must be made while all instances are closed
+and kept in private storage; restore matching database and vault files only
+while the application is closed. Keep directories at mode 0700 and data
+files at mode 0600. The test uses synthetic accounts and a mock clipboard.
+The login delay is process-local, not a persistent lockout.
+
+
+## Reproducible Linux build and CI
+
+The Dockerfile builds on Debian 13 and runs as an unprivileged user. From
+this directory, if Docker is installed:
+
+```bash
+docker build -t securepm-course .
+docker run --rm -it securepm-course
+```
+
+This disposable container is for demonstrating registration, login and local
+storage; it has no host clipboard connection. Copying passwords requires a
+supported graphical session outside the default headless container. Do not
+use real credentials in the disposable demo. The GitHub Actions workflow
+runs `make test-all` on Linux and macOS with a separate sanitizer job. Native
+macOS clipboard checks remain manual/opt-in because they modify the real
+clipboard.
+
+## Secret scan review
+
+Gitleaks 8.30.1 reported one historical `generic-api-key` finding in
+`tests/test_cli.c` at commit `35381a328a5a72479ba80842be3131f3c16d5edf`,
+line 931. Manual review confirmed it is a synthetic credential used in a
+cross-account test, not a service API key. `.gitleaksignore` contains only
+that exact finding fingerprint. No entire test directory or rule is excluded.
+The current source scan reported no findings before the final packaging step.

@@ -13,7 +13,7 @@
 #define ACCOUNT_PENDING_ERROR (-1)
 #define ACCOUNT_PENDING_MISSING 0
 #define ACCOUNT_PENDING_PRESENT 1
-#define ACCOUNT_SESSION_CONTEXT "securepm:session-capability:v1"
+#define ACCOUNT_SESSION_CONTEXT "securepm:session-capability:v2"
 
 static const unsigned char pending_magic[] = {
     'S', 'P', 'M', 'P', 'E', 'N', 'D', '1'
@@ -25,11 +25,12 @@ static int session_secret_ready;
 static int create_session_authenticator(
     const unsigned char user_id[USER_DB_USER_ID_BYTES],
     const unsigned char vmk[AUTH_VMK_BYTES],
+    const unsigned char record_digest[USER_DB_RECORD_DIGEST_BYTES],
     unsigned char authenticator[ACCOUNT_SESSION_AUTHENTICATOR_BYTES])
 {
     static const unsigned char prefix[] = ACCOUNT_SESSION_CONTEXT;
     unsigned char context[sizeof(prefix) - 1 + USER_DB_USER_ID_BYTES +
-                          AUTH_VMK_BYTES];
+                          AUTH_VMK_BYTES + USER_DB_RECORD_DIGEST_BYTES];
     size_t position = 0;
     int success = 0;
 
@@ -48,6 +49,8 @@ static int create_session_authenticator(
     position += USER_DB_USER_ID_BYTES;
     memcpy(context + position, vmk, AUTH_VMK_BYTES);
     position += AUTH_VMK_BYTES;
+    memcpy(context + position, record_digest, USER_DB_RECORD_DIGEST_BYTES);
+    position += USER_DB_RECORD_DIGEST_BYTES;
     success = crypto_hkdf_sha256(
         session_secret, sizeof(session_secret), NULL, 0,
         context, position, authenticator,
@@ -65,11 +68,33 @@ int account_session_is_valid(const struct account_session *session)
 
     if (session != NULL && session->unlocked == 1 && session_secret_ready &&
         create_session_authenticator(session->user_id, session->vmk,
-                                     expected)) {
+                                     session->record_digest, expected)) {
         valid = CRYPTO_memcmp(expected, session->authenticator,
                               sizeof(expected)) == 0;
     }
     OPENSSL_cleanse(expected, sizeof(expected));
+    return valid;
+}
+
+/* Compare the authenticated record, not the whole database: another user
+ * may register without invalidating this session. */
+int account_session_revalidate(const struct storage *storage,
+                               const struct account_session *session)
+{
+    struct user_database database;
+    const struct user_record *record;
+    unsigned char digest[USER_DB_RECORD_DIGEST_BYTES] = {0};
+    int valid = 0;
+
+    if (!account_session_is_valid(session) || !user_db_load(storage, &database)) {
+        return 0;
+    }
+    record = user_db_find_user_id(&database, session->user_id,
+                                  sizeof(session->user_id));
+    if (user_db_record_digest(record, digest)) {
+        valid = CRYPTO_memcmp(digest, session->record_digest, sizeof(digest)) == 0;
+    }
+    OPENSSL_cleanse(digest, sizeof(digest));
     return valid;
 }
 
@@ -211,6 +236,7 @@ void account_session_lock(struct account_session *session)
     }
     OPENSSL_cleanse(session->vmk, sizeof(session->vmk));
     OPENSSL_cleanse(session->user_id, sizeof(session->user_id));
+    OPENSSL_cleanse(session->record_digest, sizeof(session->record_digest));
     OPENSSL_cleanse(session->authenticator, sizeof(session->authenticator));
     session->unlocked = 0;
 }
@@ -405,8 +431,10 @@ int account_unlock(const struct storage *storage,
         goto cleanup;
     }
     OPENSSL_cleanse(keys.kek, sizeof(keys.kek));
-    if (!create_session_authenticator(record->user_id, vmk,
-                                      authenticator)) {
+    if (!user_db_record_digest(record, session->record_digest) ||
+        !create_session_authenticator(record->user_id, vmk,
+                                      session->record_digest, authenticator)) {
+        account_session_lock(session);
         goto cleanup;
     }
     memcpy(session->user_id, record->user_id, sizeof(session->user_id));

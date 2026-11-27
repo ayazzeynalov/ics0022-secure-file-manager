@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <openssl/evp.h>
 
 #define USER_DB_MAGIC_BYTES 8
 #define USER_DB_HEADER_BYTES 16
@@ -215,6 +216,43 @@ static void write_bytes(unsigned char **output, const void *data, size_t length)
     *output += length;
 }
 
+static void serialize_record(unsigned char **output, const struct user_record *record,
+                             size_t length)
+{
+    write_u32(output, record->format_version);
+    write_u16(output, (uint16_t)length);
+    write_bytes(output, record->username, length);
+    write_bytes(output, record->user_id, sizeof(record->user_id));
+    write_bytes(output, record->salt, sizeof(record->salt));
+    write_u64(output, record->scrypt.n);
+    write_u64(output, record->scrypt.r);
+    write_u64(output, record->scrypt.p);
+    write_u64(output, record->scrypt.max_memory);
+    write_bytes(output, record->authentication_verifier,
+                sizeof(record->authentication_verifier));
+    write_bytes(output, record->wrapped_vmk,
+                sizeof(record->wrapped_vmk));
+    write_bytes(output, record->vmk_nonce, sizeof(record->vmk_nonce));
+    write_bytes(output, record->vmk_tag, sizeof(record->vmk_tag));
+}
+
+int user_db_record_digest(const struct user_record *record,
+                          unsigned char digest[USER_DB_RECORD_DIGEST_BYTES])
+{
+    unsigned char encoded[USER_DB_RECORD_FIXED_BYTES + USER_DB_USERNAME_MAX_BYTES];
+    unsigned char *output = encoded;
+    unsigned int digest_length = 0;
+    size_t length;
+
+    if (digest == NULL || !valid_record(record, &length)) {
+        return 0;
+    }
+    serialize_record(&output, record, length);
+    return EVP_Digest(encoded, (size_t)(output - encoded), digest,
+                      &digest_length, EVP_sha256(), NULL) == 1 &&
+           digest_length == USER_DB_RECORD_DIGEST_BYTES;
+}
+
 int user_db_save(const struct storage *storage,
                  const struct user_database *database)
 {
@@ -255,21 +293,7 @@ int user_db_save(const struct storage *storage,
             errno = EINVAL;
             return 0;
         }
-        write_u32(&output, record->format_version);
-        write_u16(&output, (uint16_t)length);
-        write_bytes(&output, record->username, length);
-        write_bytes(&output, record->user_id, sizeof(record->user_id));
-        write_bytes(&output, record->salt, sizeof(record->salt));
-        write_u64(&output, record->scrypt.n);
-        write_u64(&output, record->scrypt.r);
-        write_u64(&output, record->scrypt.p);
-        write_u64(&output, record->scrypt.max_memory);
-        write_bytes(&output, record->authentication_verifier,
-                    sizeof(record->authentication_verifier));
-        write_bytes(&output, record->wrapped_vmk,
-                    sizeof(record->wrapped_vmk));
-        write_bytes(&output, record->vmk_nonce, sizeof(record->vmk_nonce));
-        write_bytes(&output, record->vmk_tag, sizeof(record->vmk_tag));
+        serialize_record(&output, record, length);
     }
     result = storage_atomic_write(storage, STORAGE_AREA_ROOT,
                                   USER_DB_FILENAME,
@@ -356,7 +380,8 @@ static int parse_record(struct read_cursor *cursor,
         return 0;
     }
     record->username[username_length_value] = '\0';
-    return valid_record(record, NULL);
+    return user_db_username_valid(record->username, username_length_value) &&
+           valid_record(record, NULL);
 }
 
 static int parse_database(const unsigned char *data, size_t data_length,

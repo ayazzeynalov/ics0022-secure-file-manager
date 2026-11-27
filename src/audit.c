@@ -11,7 +11,8 @@
 #include <time.h>
 
 #define AUDIT_TIMESTAMP_BYTES 21
-#define AUDIT_RECORD_MAX_BYTES 160
+#define AUDIT_RECORD_MAX_BYTES 192
+#define AUDIT_ROTATION_LOCK "audit.rotation.lock"
 
 static const char *event_name(enum audit_event event)
 {
@@ -49,9 +50,15 @@ static const char *outcome_name(enum audit_outcome outcome)
     return NULL;
 }
 
-int audit_log_event(const struct storage *storage, enum audit_event event,
-                    enum audit_outcome outcome)
+int audit_log_actor(const struct storage *storage, enum audit_event event,
+                    enum audit_outcome outcome,
+                    const unsigned char actor_id[AUDIT_ACTOR_ID_BYTES])
 {
+    static const char hex[] = "0123456789abcdef";
+    char actor[2 * AUDIT_ACTOR_ID_BYTES + 3] = "null";
+    struct storage_lock lock = STORAGE_LOCK_INITIALIZER;
+    unsigned char *previous = NULL;
+    size_t previous_length = 0;
     char timestamp[AUDIT_TIMESTAMP_BYTES];
     char record[AUDIT_RECORD_MAX_BYTES];
     const char *event_text = event_name(event);
@@ -69,11 +76,24 @@ int audit_log_event(const struct storage *storage, enum audit_event event,
             sizeof(timestamp) - 1) {
         goto cleanup;
     }
+    if (actor_id != NULL) {
+        actor[0] = '"';
+        for (size_t i = 0; i < AUDIT_ACTOR_ID_BYTES; ++i) {
+            actor[1 + 2 * i] = hex[actor_id[i] >> 4];
+            actor[2 + 2 * i] = hex[actor_id[i] & 15U];
+        }
+        actor[1 + 2 * AUDIT_ACTOR_ID_BYTES] = '"';
+        actor[2 + 2 * AUDIT_ACTOR_ID_BYTES] = '\0';
+    }
     record_length = snprintf(record, sizeof(record),
                              "{\"timestamp\":\"%s\",\"event\":\"%s\","
-                             "\"outcome\":\"%s\"}\n",
-                             timestamp, event_text, outcome_text);
+                             "\"outcome\":\"%s\",\"actor_id\":%s}\n",
+                             timestamp, event_text, outcome_text, actor);
     if (record_length < 0 || (size_t)record_length >= sizeof(record)) {
+        goto cleanup;
+    }
+    if (!storage_lock_acquire(storage, STORAGE_AREA_ROOT,
+                              AUDIT_ROTATION_LOCK, &lock)) {
         goto cleanup;
     }
     success = storage_append_file(storage, STORAGE_AREA_ROOT,
@@ -82,7 +102,36 @@ int audit_log_event(const struct storage *storage, enum audit_event event,
                                   (size_t)record_length,
                                   AUDIT_LOG_MAX_BYTES);
 
+    /* Preserve the active log until its archive is durable. A failed
+     * second replacement can leave duplicate history. */
+    if (!success && errno == EFBIG &&
+        storage_read_file(storage, STORAGE_AREA_ROOT, AUDIT_LOG_FILENAME,
+                          AUDIT_LOG_MAX_BYTES, &previous,
+                          &previous_length) == STORAGE_READ_OK &&
+        (size_t)record_length > AUDIT_LOG_MAX_BYTES - previous_length &&
+        storage_lock_validate(storage, STORAGE_AREA_ROOT,
+                              AUDIT_ROTATION_LOCK, &lock) &&
+        storage_atomic_write(storage, STORAGE_AREA_ROOT,
+                             AUDIT_ARCHIVE_FILENAME, previous,
+                             previous_length) &&
+        storage_lock_validate(storage, STORAGE_AREA_ROOT,
+                              AUDIT_ROTATION_LOCK, &lock)) {
+        success = storage_atomic_replace(storage, STORAGE_AREA_ROOT,
+                                         AUDIT_LOG_FILENAME, previous,
+                                         previous_length,
+                                         (const unsigned char *)record,
+                                         (size_t)record_length);
+    }
+
 cleanup:
+    storage_free(previous);
+    storage_lock_release(&lock);
     errno = caller_errno;
     return success;
+}
+
+int audit_log_event(const struct storage *storage, enum audit_event event,
+                    enum audit_outcome outcome)
+{
+    return audit_log_actor(storage, event, outcome, NULL);
 }

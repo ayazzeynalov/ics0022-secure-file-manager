@@ -1,5 +1,5 @@
 CC ?= cc
-CFLAGS ?= -Wall -Wextra -Wpedantic -Wformat=2 -Wformat-security
+CFLAGS ?= -fstack-protector-strong -Wall -Wextra -Wpedantic -Wformat=2 -Wformat-security
 PKG_CONFIG ?= pkg-config
 PTY_LIBS ?= $(if $(filter Linux,$(shell uname -s)),-lutil,)
 
@@ -24,9 +24,9 @@ DEP = $(OBJ:.o=.d) build/test_crypto.d build/test_auth.d build/test_storage.d \
 	build/test_user_db.d build/test_account.d build/test_vault.d \
 	build/test_credentials.d build/test_cli.d build/test_input.d \
 	build/test_audit.d build/test_access_control.d build/storage_test.d \
-	build/clipboard_test.d
+	build/clipboard_test.d build/input_test.d
 
-.PHONY: all clean test test-snapshot test-clipboard check-openssl
+.PHONY: all clean test test-all test-memory test-snapshot test-clipboard test-idle test-session-auth test-audit-hardening test-input-boundaries test-recovery check-openssl
 all: $(TARGET)
 
 $(TARGET): $(OBJ) | check-openssl
@@ -126,7 +126,10 @@ build/clipboard_test.o: src/clipboard.c | build check-openssl
 build/test_clipboard_sink: tests/clipboard_sink.c | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c17 $(LDFLAGS) $< $(LDLIBS) -o $@
 
-build/securepm_test: $(filter-out build/clipboard.o,$(OBJ)) build/clipboard_test.o | check-openssl
+build/input_test.o: src/input.c | build check-openssl
+	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -DSECUREPM_INPUT_TEST -std=c17 -MMD -MP -c $< -o $@
+
+build/securepm_test: $(filter-out build/clipboard.o build/input.o,$(OBJ)) build/clipboard_test.o build/input_test.o | check-openssl
 	$(CC) $(LDFLAGS) $^ $(OPENSSL_LIBS) $(LDLIBS) -o $@
 
 test: $(TARGET) build/securepm_test build/test_clipboard_sink build/test_crypto build/test_auth build/test_storage \
@@ -151,6 +154,34 @@ test-snapshot: build/securepm_test build/test_clipboard_sink
 
 test-clipboard: build/securepm_test build/test_clipboard_sink
 	python3 -B tests/test_clipboard_expiry.py
+
+test-idle: build/securepm_test build/test_clipboard_sink
+	python3 -B tests/test_idle_timeout.py
+
+test-session-auth: build/securepm_test build/test_clipboard_sink
+	python3 -B tests/test_session_auth.py
+
+build/test_core_limit: src/main.c tests/test_core_limit.c | build
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) -std=c17 $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+test-audit-hardening: build/securepm_test build/test_clipboard_sink build/test_audit build/test_core_limit
+	./build/test_core_limit
+	./build/test_audit
+	python3 -B tests/test_audit_actors.py
+
+test-input-boundaries: build/securepm_test build/test_clipboard_sink
+	python3 -B tests/test_input_boundaries.py
+
+test-recovery: build/test_vault build/securepm_test build/test_clipboard_sink
+	./build/test_vault
+	python3 -B tests/test_recovery_and_throttle.py
+
+# Run all portable automated tests; native clipboard and memory inspection are opt-in.
+test-all: test test-snapshot test-clipboard test-idle test-session-auth \
+          test-audit-hardening test-input-boundaries test-recovery
+
+test-memory: $(TARGET)
+	python3 -B tests/test_memory_lifecycle.py
 
 clean:
 	rm -rf build

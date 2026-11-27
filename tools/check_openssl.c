@@ -13,5 +13,6 @@ int main(void)
         return 1;
     }
 
+    printf("Crypto runtime: %s\n", OpenSSL_version(OPENSSL_VERSION));
     return 0;
 }

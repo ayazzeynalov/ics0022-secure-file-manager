@@ -13,6 +13,7 @@
 #define USER_DB_RECORD_VERSION AUTH_VMK_FORMAT_VERSION
 #define USER_DB_USERNAME_MAX_BYTES 64
 #define USER_DB_USER_ID_BYTES 16
+#define USER_DB_RECORD_DIGEST_BYTES 32
 #define USER_DB_MAX_USERS 256
 
 struct user_record {
@@ -31,6 +32,9 @@ struct user_database {
     size_t count;
     struct user_record records[USER_DB_MAX_USERS];
 };
+
+int user_db_record_digest(const struct user_record *record,
+                          unsigned char digest[USER_DB_RECORD_DIGEST_BYTES]);
 
 void user_db_init(struct user_database *database);
 

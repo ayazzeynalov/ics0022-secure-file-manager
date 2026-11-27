@@ -28,6 +28,7 @@
 
 void storage_test_fail_atomic_sync_after(unsigned int writes);
 void storage_test_fail_atomic_precommit_once(void);
+void storage_test_partial_write_then_enospc_once(void);
 
 static unsigned int checks;
 static unsigned int failures;
@@ -479,6 +480,54 @@ static void test_precommit_failure_is_not_reconciled(
     storage_free(before);
 }
 
+/* Inject ENOSPC after writing one byte to the temporary file. */
+static void test_enospc_preserves_vault(const struct storage *storage,
+                                       const struct account_session *session)
+{
+    static const unsigned char old[] = "original vault payload";
+    static const unsigned char updated[] = "new vault payload";
+    struct storage_lock lock = STORAGE_LOCK_INITIALIZER;
+    unsigned char *before = NULL, *after = NULL;
+    size_t before_length = 0, after_length = 0;
+    char filename[TEST_FILENAME_BYTES];
+    DIR *directory;
+    struct dirent *entry;
+
+    make_filename(session->user_id, filename);
+    CHECK(vault_write(storage, session, old, sizeof(old) - 1) == 1);
+    CHECK(storage_read_file(storage, STORAGE_AREA_VAULTS, filename,
+                            STORAGE_MAX_FILE_BYTES, &before,
+                            &before_length) == STORAGE_READ_OK);
+    CHECK(vault_lock_acquire(storage, session, &lock) == 1);
+    storage_test_partial_write_then_enospc_once();
+    CHECK(vault_replace_if_current(storage, session, &lock,
+              old, sizeof(old) - 1, updated, sizeof(updated) - 1) == 0);
+    CHECK(storage_read_file(storage, STORAGE_AREA_VAULTS, filename,
+                            STORAGE_MAX_FILE_BYTES, &after,
+                            &after_length) == STORAGE_READ_OK);
+    CHECK(before != NULL && after != NULL && before_length == after_length &&
+          memcmp(before, after, before_length) == 0);
+    check_round_trip(storage, session, old, sizeof(old) - 1);
+    int fd = openat(storage->vaults_fd, ".", O_RDONLY | O_DIRECTORY);
+    directory = fd >= 0 ? fdopendir(fd) : NULL;
+    CHECK(directory != NULL);
+    if (directory != NULL) {
+        int found = 0;
+        while ((entry = readdir(directory)) != NULL) {
+            if (strncmp(entry->d_name, ".securepm.tmp.",
+                        sizeof(".securepm.tmp.") - 1) == 0) found = 1;
+        }
+        CHECK(!found);
+        CHECK(closedir(directory) == 0);
+    } else if (fd >= 0) close(fd);
+    CHECK(vault_replace_if_current(storage, session, &lock,
+              old, sizeof(old) - 1, updated, sizeof(updated) - 1) == 1);
+    storage_lock_release(&lock);
+    check_round_trip(storage, session, updated, sizeof(updated) - 1);
+    storage_free(before);
+    storage_free(after);
+}
+
 static void test_empty_vault(const struct storage *storage,
                              const struct account_session *session)
 {
@@ -759,6 +808,13 @@ int main(void)
                                          &valid_file, &valid_file_length);
         test_committed_write_reconciliation(&storage, &session);
         test_precommit_failure_is_not_reconciled(&storage, &session);
+        {
+            unsigned int failures_before = failures;
+            test_enospc_preserves_vault(&storage, &session);
+            if (failures == failures_before) {
+                puts("PASS: simulated partial write and ENOSPC preserve vault");
+            }
+        }
         test_concurrent_updates(&storage, &session);
         test_empty_vault(&storage, &session);
         test_external_changes_fail_closed(&storage, &session);

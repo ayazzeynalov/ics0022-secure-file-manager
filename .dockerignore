@@ -1,0 +1,11 @@
+**
+!Makefile
+!src/
+!src/**
+!tools/
+!tools/**
+!tests/
+!tests/**
+**/__pycache__/
+**/*.pyc
+**/*.o
