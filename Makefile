@@ -17,13 +17,14 @@ OPENSSL_LIBS ?= -lcrypto
 
 TARGET = securepm
 SRC = src/main.c src/cli.c src/input.c src/crypto.c src/auth.c src/storage.c \
-	src/audit.c \
+	src/audit.c src/clipboard.c \
 	src/user_db.c src/account.c src/vault.c src/credentials.c
 OBJ = $(SRC:src/%.c=build/%.o)
 DEP = $(OBJ:.o=.d) build/test_crypto.d build/test_auth.d build/test_storage.d \
 	build/test_user_db.d build/test_account.d build/test_vault.d \
 	build/test_credentials.d build/test_cli.d build/test_input.d \
-	build/test_audit.d build/test_access_control.d build/storage_test.d
+	build/test_audit.d build/test_access_control.d build/storage_test.d \
+	build/clipboard_test.d
 
 .PHONY: all clean test check-openssl
 all: $(TARGET)
@@ -119,7 +120,16 @@ build/test_input.o: tests/test_input.c | build check-openssl
 build/test_input: build/test_input.o build/input.o | check-openssl
 	$(CC) $(LDFLAGS) $^ $(OPENSSL_LIBS) $(LDLIBS) -o $@
 
-test: $(TARGET) build/test_crypto build/test_auth build/test_storage \
+build/clipboard_test.o: src/clipboard.c | build check-openssl
+	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -DSECUREPM_CLIPBOARD_TEST -std=c17 -MMD -MP -c $< -o $@
+
+build/test_clipboard_sink: tests/clipboard_sink.c | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c17 $(LDFLAGS) $< $(LDLIBS) -o $@
+
+build/securepm_test: $(filter-out build/clipboard.o,$(OBJ)) build/clipboard_test.o | check-openssl
+	$(CC) $(LDFLAGS) $^ $(OPENSSL_LIBS) $(LDLIBS) -o $@
+
+test: $(TARGET) build/securepm_test build/test_clipboard_sink build/test_crypto build/test_auth build/test_storage \
 		build/test_user_db build/test_account build/test_vault \
 		build/test_credentials build/test_cli build/test_input build/test_audit \
 		build/test_access_control
@@ -134,7 +144,7 @@ test: $(TARGET) build/test_crypto build/test_auth build/test_storage \
 	./build/test_account
 	./build/test_vault
 	./build/test_credentials
-	./build/test_cli ./$(TARGET)
+	./build/test_cli ./build/securepm_test
 
 clean:
 	rm -rf build

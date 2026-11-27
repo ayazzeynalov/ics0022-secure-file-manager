@@ -9,6 +9,7 @@
 #include "account.h"
 #include "audit.h"
 #include "credentials.h"
+#include "clipboard.h"
 #include "input.h"
 #include "storage.h"
 #include "vault.h"
@@ -390,6 +391,7 @@ static void list_credentials(const struct account_session *session,
 
 static int view_credential(const struct storage *storage,
                            const struct account_session *session,
+                           const struct storage_lock *vault_lock,
                            const struct credential_collection *collection)
 {
     unsigned char record_id[CREDENTIALS_RECORD_ID_BYTES] = {0};
@@ -422,13 +424,13 @@ static int view_credential(const struct storage *storage,
     fputs("\nNotes: ", stdout);
     print_safe_field(record->notes, record->notes_length);
     fputs("\nPassword: hidden\n", stdout);
-    puts("Warning: revealed passwords may remain visible in terminal output.");
+    puts("Warning: other applications may read the clipboard. Clear it after use.");
     if (!input_discard_pending()) {
         action = input_interrupted_signal() != 0 ? ACTION_INPUT_END :
                                                    ACTION_CONTINUE;
         goto cleanup;
     }
-    read_result = read_value("Type yes to reveal password: ", confirmation,
+    read_result = read_value("Type yes to copy password: ", confirmation,
                              sizeof(confirmation), &confirmation_length, 0);
     if (read_result <= 0) {
         action = read_result < 0 ? ACTION_INPUT_END : ACTION_CONTINUE;
@@ -437,15 +439,20 @@ static int view_credential(const struct storage *storage,
     if (confirmation_length != 3 ||
         memcmp(confirmation, "yes", 3) != 0) {
         puts("Password remains hidden.");
-        record_audit_event(storage, AUDIT_EVENT_PASSWORD_REVEAL,
+        record_audit_event(storage, AUDIT_EVENT_PASSWORD_COPY,
                            AUDIT_OUTCOME_CANCELLED);
         goto cleanup;
     }
-    record_audit_event(storage, AUDIT_EVENT_PASSWORD_REVEAL,
+    if (!verify_current_collection(storage, session, vault_lock, collection) ||
+        !clipboard_copy(record->password, record->password_length)) {
+        puts("Password could not be copied.");
+        record_audit_event(storage, AUDIT_EVENT_PASSWORD_COPY,
+                           AUDIT_OUTCOME_FAILURE);
+        goto cleanup;
+    }
+    puts("Password copied.");
+    record_audit_event(storage, AUDIT_EVENT_PASSWORD_COPY,
                        AUDIT_OUTCOME_SUCCESS);
-    fputs("Password: ", stdout);
-    print_safe_field(record->password, record->password_length);
-    putchar('\n');
 
 cleanup:
     OPENSSL_cleanse(record_id, sizeof(record_id));
@@ -787,7 +794,7 @@ static int authenticated_menu(
         } else if (choice_length == 1 && choice[0] == '2') {
             list_credentials(session, collection);
         } else if (choice_length == 1 && choice[0] == '3') {
-            if (view_credential(storage, session, collection) ==
+            if (view_credential(storage, session, vault_lock, collection) ==
                 ACTION_INPUT_END) {
                 return ACTION_INPUT_END;
             }

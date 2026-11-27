@@ -692,14 +692,14 @@ static void test_terminal_signals(const char *program, const char *home,
         {"Credential password: ", "dummy-never-saved-secret\n"},
         {"Notes (optional): ", NULL}
     };
-    struct dialog_step reveal_prompt[] = {
+    struct dialog_step copy_prompt[] = {
         {"Choice: ", "2\n"},
         {"Username: ", "Alice\n"},
         {"Master password: ", "dummy-master-password-42\n"},
         {"Login successful.", NULL},
         {"Choice: ", "3\n"},
         {"Record ID: ", record_id},
-        {"Type yes to reveal password: ", NULL}
+        {"Type yes to copy password: ", NULL}
     };
     struct dialog_step delete_prompt[] = {
         {"Choice: ", "2\n"},
@@ -753,7 +753,7 @@ static void test_terminal_signals(const char *program, const char *home,
                           NULL, 0,
                           (const unsigned char *)"dummy-never-saved-secret",
                           sizeof("dummy-never-saved-secret") - 1);
-    test_signal_at_prompt(program, home, reveal_prompt, 7, SIGQUIT, 0x1c,
+    test_signal_at_prompt(program, home, copy_prompt, 7, SIGQUIT, 0x1c,
                           NULL, 0,
                           (const unsigned char *)"dummy-credential-secret-73",
                           sizeof("dummy-credential-secret-73") - 1);
@@ -846,7 +846,7 @@ static void test_queued_confirmations(const char *program, const char *home,
     CHECK(length > 0 && (size_t)length < sizeof(paste));
     CHECK(write_bytes(master, paste, (size_t)length));
     CHECK(wait_for_text(master, &transcript,
-                        "Type yes to reveal password: "));
+                        "Type yes to copy password: "));
     CHECK(write_all(master, "no\n"));
     CHECK(wait_for_text(master, &transcript, "Password remains hidden."));
     CHECK(!contains_bytes(transcript.data, transcript.length,
@@ -1375,6 +1375,7 @@ int main(int argc, char *argv[])
         return 1;
     }
     program = argv[1];
+    CHECK(unsetenv("SECUREPM_TEST_CLIPBOARD_EXPECTED") == 0);
     home = make_temporary_home(home_template);
     CHECK(home != NULL);
     if (home == NULL) {
@@ -1546,7 +1547,7 @@ int main(int argc, char *argv[])
             {"Label: Example\"},{\"event\":\"forged | Username: dummy-user", NULL},
             {"Choice: ", "7\n"}
         };
-        const struct dialog_step verify_bob_steps[] = {
+        struct dialog_step verify_bob_steps[] = {
             {"Choice: ", "2\n"},
             {"Username: ", "Bob\n"},
             {"Master password: ", "dummy-bob-master-password\n"},
@@ -1555,8 +1556,8 @@ int main(int argc, char *argv[])
             {"Record ID: ", bob_record_id},
             {"Notes: bob private notes", NULL},
             {"Password: hidden", NULL},
-            {"Type yes to reveal password: ", "yes\n"},
-            {"Password: dummy-bob-secret-58", NULL},
+            {"Type yes to copy password: ", "yes\n"},
+            {"Password copied.", NULL},
             {"Choice: ", "7\n"}
         };
         static const struct dialog_step failed_bob_login_steps[] = {
@@ -1581,13 +1582,22 @@ int main(int argc, char *argv[])
                          sizeof(failed_bob_login_steps) /
                              sizeof(failed_bob_login_steps[0]),
                          &transcript));
+        CHECK(setenv("SECUREPM_TEST_CLIPBOARD_EXPECTED", bob_credential_password, 1) == 0);
         CHECK(run_dialog(program, home, verify_bob_steps,
                          sizeof(verify_bob_steps) /
                              sizeof(verify_bob_steps[0]),
                          &transcript));
-        CHECK(contains_bytes(transcript.data, transcript.length,
-                             (const unsigned char *)bob_credential_password,
-                             sizeof(bob_credential_password) - 1));
+        CHECK(!contains_bytes(transcript.data, transcript.length,
+                              (const unsigned char *)bob_credential_password,
+                              sizeof(bob_credential_password) - 1));
+        CHECK(unsetenv("SECUREPM_TEST_CLIPBOARD_EXPECTED") == 0);
+        verify_bob_steps[9].expected = "Password could not be copied.";
+        CHECK(run_dialog(program, home, verify_bob_steps,
+                         sizeof(verify_bob_steps) / sizeof(verify_bob_steps[0]),
+                         &transcript));
+        CHECK(!contains_bytes(transcript.data, transcript.length,
+                              (const unsigned char *)bob_credential_password,
+                              sizeof(bob_credential_password) - 1));
         CHECK(!contains_bytes(transcript.data, transcript.length,
                               (const unsigned char *)credential_password,
                               sizeof(credential_password) - 1));
@@ -1619,9 +1629,9 @@ int main(int argc, char *argv[])
             {"Username: dummy-user", NULL},
             {"Notes: dummy notes", NULL},
             {"Password: hidden", NULL},
-            {"Warning: revealed passwords may remain visible in terminal "
-             "output.", NULL},
-            {"Type yes to reveal password: ", "no\n"},
+            {"Warning: other applications may read the clipboard. "
+             "Clear it after use.", NULL},
+            {"Type yes to copy password: ", "no\n"},
             {"Password remains hidden.", NULL},
             {"Choice: ", "7\n"}
         };
@@ -1691,13 +1701,14 @@ int main(int argc, char *argv[])
                 {"Record ID: ", record_id},
                 {"Notes: updated notes", NULL},
                 {"Password: hidden", NULL},
-                {"Warning: revealed passwords may remain visible in terminal "
-                 "output.", NULL},
-                {"Type yes to reveal password: ", "yes\n"},
-                {"Password: updated-dummy-secret-91", NULL},
+                {"Warning: other applications may read the clipboard. "
+                 "Clear it after use.", NULL},
+                {"Type yes to copy password: ", "yes\n"},
+                {"Password copied.", NULL},
                 {"Choice: ", "7\n"}
             };
 
+            CHECK(setenv("SECUREPM_TEST_CLIPBOARD_EXPECTED", updated_password, 1) == 0);
             CHECK(run_dialog(program, home, persisted_update_steps,
                              sizeof(persisted_update_steps) /
                                  sizeof(persisted_update_steps[0]),
@@ -1705,9 +1716,10 @@ int main(int argc, char *argv[])
             CHECK(!contains_bytes(transcript.data, transcript.length,
                                   (const unsigned char *)credential_password,
                                   sizeof(credential_password) - 1));
-            CHECK(contains_bytes(transcript.data, transcript.length,
-                                 (const unsigned char *)updated_password,
-                                 sizeof(updated_password) - 1));
+            CHECK(!contains_bytes(transcript.data, transcript.length,
+                                  (const unsigned char *)updated_password,
+                                  sizeof(updated_password) - 1));
+            CHECK(unsetenv("SECUREPM_TEST_CLIPBOARD_EXPECTED") == 0);
         }
         {
             const struct dialog_step delete_steps[] = {
@@ -1867,8 +1879,9 @@ int main(int argc, char *argv[])
             "\"event\":\"credential_delete\",\"outcome\":\"success\"",
             "\"event\":\"credential_delete\",\"outcome\":\"failure\"",
             "\"event\":\"credential_delete\",\"outcome\":\"cancelled\"",
-            "\"event\":\"password_reveal\",\"outcome\":\"success\"",
-            "\"event\":\"password_reveal\",\"outcome\":\"cancelled\"",
+            "\"event\":\"password_copy\",\"outcome\":\"success\"",
+            "\"event\":\"password_copy\",\"outcome\":\"cancelled\"",
+            "\"event\":\"password_copy\",\"outcome\":\"failure\"",
             "\"event\":\"session_lock\",\"outcome\":\"success\""
         };
         static const char *const forbidden_values[] = {

@@ -225,12 +225,12 @@ static void test_schema_and_minimization(const struct storage *storage,
         AUDIT_EVENT_CREDENTIAL_CREATE,
         AUDIT_EVENT_CREDENTIAL_UPDATE,
         AUDIT_EVENT_CREDENTIAL_DELETE,
-        AUDIT_EVENT_PASSWORD_REVEAL,
+        AUDIT_EVENT_PASSWORD_COPY,
         AUDIT_EVENT_SESSION_LOCK
     };
     static const char *const event_names[] = {
         "user_registration", "login", "vault_load", "credential_create",
-        "credential_update", "credential_delete", "password_reveal",
+        "credential_update", "credential_delete", "password_copy",
         "session_lock"
     };
     static const enum audit_outcome outcomes[] = {

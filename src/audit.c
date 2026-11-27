@@ -28,8 +28,8 @@ static const char *event_name(enum audit_event event)
         return "credential_update";
     case AUDIT_EVENT_CREDENTIAL_DELETE:
         return "credential_delete";
-    case AUDIT_EVENT_PASSWORD_REVEAL:
-        return "password_reveal";
+    case AUDIT_EVENT_PASSWORD_COPY:
+        return "password_copy";
     case AUDIT_EVENT_SESSION_LOCK:
         return "session_lock";
     }
