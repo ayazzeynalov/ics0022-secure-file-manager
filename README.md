@@ -5,16 +5,22 @@ is written in C17 and uses OpenSSL 3.x and POSIX APIs.
 
 ## Project status
 
-Checkpoint 3 implementation is available on the
-`feature/checkpoint3-crud` branch.
+Final-project implementation extends the Checkpoint 3 code with
+clipboard-only password retrieval and operation-scoped credential decryption.
 
 The application supports user authentication, encrypted credential
 storage, credential management, per-user access control, and
 structured security logging.
 
-The automated test suite passed 3,666 checks on macOS.
-Additional testing included AddressSanitizer, UndefinedBehaviorSanitizer,
-and fuzzing of credential data, the user database, and encrypted vaults.
+The final implementation passed 3,674 automated checks on macOS and
+3,652 on Linux x86-64 (GCC 14.2, OpenSSL 3.5.5); platform-specific ACL
+tests account for the difference. Ten additional session snapshot checks
+passed on both platforms. On Linux the full suite and snapshot tests also
+passed under Clang 17 AddressSanitizer and UndefinedBehaviorSanitizer.
+Clang Static Analyzer reported no diagnostics in the 12 production C files,
+and credential-parser fuzzing completed 10,000 runs without a crash.
+The production clipboard was tested on macOS; Linux clipboard integration
+was tested with an isolated test backend, not a graphical session.
 
 The remaining limitations are documented below.
 
@@ -29,7 +35,7 @@ The current command-line application supports:
 - listing credential record IDs, labels, and usernames without displaying
   passwords;
 - viewing a credential by record ID, with its password hidden unless the user
-  acknowledges a terminal-output warning and explicitly requests reveal;
+  explicitly confirms copying it to the system clipboard;
 - updating and deleting credentials by record ID;
 - locking the active session;
 - recording minimized structured security audit events; and
@@ -85,10 +91,20 @@ Vault menu:
 
 Adding, updating, or deleting a credential rewrites the encrypted vault
 atomically while the user's vault lock is held. Viewing displays the record ID,
-label, username, and notes, but keeps the password hidden unless the user types
-`yes` after a warning that terminal output may remain visible. Listing never
-displays passwords. Passwords are never accepted as command-line arguments. Run
+label, username, and notes, and always keeps the password hidden in terminal
+output. Type `yes` at the confirmation prompt to copy it to the system
+clipboard. Paste it into the intended application and clear the clipboard
+after use. Other applications and clipboard history tools may read it; the
+password manager does not automatically clear it. Listing never displays
+passwords. Passwords are never accepted as command-line arguments. Run
 `./securepm --help` for the command summary.
+
+On macOS, retrieval uses `/usr/bin/pbcopy`. On Linux, it requires a graphical
+Wayland session with `/usr/bin/wl-copy` or an X11 session with `/usr/bin/xclip`.
+The helper receives password bytes through a local socket, not command-line
+arguments or a shell. Without a supported helper, copying fails with a generic
+message; there is no cleartext terminal fallback. The actual graphical Linux
+clipboard has not been validated in the current test environment.
 
 The interactive process handles `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`, and
 `SIGTSTP` by notifying the normal input path and then performing ordinary
@@ -97,19 +113,21 @@ Ctrl+Z terminates the session instead of suspending an unlocked vault. Terminal
 software flow control is disabled while the application is running so that
 Ctrl+S cannot leave output apparently frozen, and the original terminal state
 is restored at exit. Password echo is restored on recoverable secret-input exit
-paths. Reveal and deletion confirmations discard input that was already queued
+paths. Copy and deletion confirmations discard input that was already queued
 before the confirmation prompt, so a pasted sequence cannot supply its own
 future `yes` response.
 
-An authenticated session retains a decrypted credential collection in memory,
-but it does not treat that cached copy as permission to reconstruct a missing
-or externally changed vault. Before displaying or modifying credentials, the
-CLI verifies that the pathname-bound vault lock is still current and that the
-authenticated vault plaintext matches the in-memory collection. Updates use an
-exact compare-before-replace operation on the encrypted file. A missing,
-corrupted, replaced, permission-changed, or concurrently updated vault locks the
-session or makes the requested update fail; it is never silently replaced with
-the cached snapshot.
+An authenticated session retains the VMK and a keyed HMAC-SHA256 snapshot
+of the expected serialized vault payload. The snapshot key is independently
+randomized for each login and cleared on session exit. The credential
+collection is decrypted and checked on demand, then explicitly cleared before
+returning to the vault menu. The collection can remain in memory during an
+interactive operation, including its confirmation prompt. Before copying a
+password, the vault is revalidated. Updates use an exact compare-before-replace
+operation on the encrypted file; successful changes refresh the expected
+snapshot. A missing, corrupted or externally changed vault causes an operation
+to fail or the session to lock. A valid older payload is rejected during an
+active session; rollback across separate logins is not prevented.
 
 ## Per-user access control
 
@@ -128,7 +146,7 @@ or using the wrong session therefore fails authentication without publishing
 plaintext. Per-user lock filenames serialize each account's read-modify-write
 operations independently.
 
-After vault authentication, CRUD and password-reveal lookups operate only on
+After vault authentication, CRUD and password-copy lookups operate only on
 the current session's decrypted credential collection. Record IDs are not
 global references: knowing an ID from another vault does not grant access, and
 there is no cross-vault credential lookup. The lower-level credential collection
@@ -155,8 +173,7 @@ line. Records have a fixed schema and use UTC RFC 3339 timestamps:
 ```
 
 Event names are fixed in the program and cover user registration, login, vault
-load, credential creation/update/deletion, confirmed or cancelled password
-reveal, and session lock. Outcomes are limited to `success`, `failure`, and
+load, credential creation/update/deletion, password copy attempts with recorded outcomes, and session lock. Outcomes are limited to `success`, `failure`, and
 `cancelled`. A modifying operation is recorded as successful only after the
 encrypted vault has been durably replaced.
 
@@ -211,7 +228,9 @@ of ordinary partial-write errors.
   terminal input is flushed when terminal settings are restored after normal
   input, EOF, errors, or handled signals. Password-derived keys, plaintext
   payloads, credential collections, and session VMKs are cleared with OpenSSL
-  cleanup functions when released.
+  cleanup functions when released. The master password is cleared after
+  authentication or registration, and the collection is cleared between menu
+  operations.
 - **Concurrent access:** stable `0600` lock files serialize user registration
   and each vault's complete read-modify-write session. Data files continue to
   use atomic replacement. Storage retains descriptors for `HOME`, the private
@@ -277,10 +296,10 @@ make OPENSSL_CFLAGS='-I/opt/openssl/include' \
      OPENSSL_LIBS='-L/opt/openssl/lib -lcrypto'
 ```
 
-The application and full test suite were previously validated on Ubuntu 24.04.5
-ARM64 with GCC 13.3.0 and OpenSSL 3.0.13. The current hardening changes must be
-revalidated in the target Linux or WSL2 environment before claiming a current
-Linux result.
+For Linux graphical clipboard retrieval, install `wl-clipboard` on Wayland or
+`xclip` on X11 as appropriate. Python 3 is needed only for the additional
+session snapshot regression test. The Linux results above cover command-line
+build and automated tests, not the native graphical clipboard.
 
 ## Tests
 
@@ -301,6 +320,31 @@ Linux result.
   restoration, queued confirmation input, failed credential persistence, audit
   event coverage, log injection resistance, and audit-write failure handling.
 
+Run the additional session rollback regression tests from the repository root:
+
+```bash
+make test-snapshot
+```
+
+For a Clang sanitizer build on Linux:
+
+```bash
+make clean
+make CC=clang CFLAGS="-Wall -Wextra -Wpedantic -Wformat=2 -Wformat-security -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" LDFLAGS="-fsanitize=address,undefined" test test-snapshot
+```
+
+For credential-parser fuzzing with Clang/libFuzzer, run from the repository root:
+
+```bash
+mkdir -p build/fuzz-corpus
+cp tests/fuzz_corpus/* build/fuzz-corpus/
+clang -std=c17 -g -O1 -fsanitize=fuzzer,address,undefined -Isrc \
+  tests/fuzz_credentials.c src/credentials.c src/crypto.c src/vault.c \
+  src/account.c src/user_db.c src/storage.c src/auth.c -lcrypto \
+  -o build/fuzz_credentials
+./build/fuzz_credentials -runs=10000 -max_len=4096 build/fuzz-corpus
+```
+
 Filesystem tests use isolated temporary `HOME` directories and dummy secrets.
 The test suite covers authentication failures, malformed and truncated files,
 atomic replacement, secure cleanup, and restart persistence. It is not a
@@ -308,9 +352,12 @@ security audit or a benchmark of password-guessing resistance.
 
 ## Remaining limitations and planned work
 
-Stored passwords are available to the authenticated process and can be revealed
-in terminal output after explicit confirmation; the application does not yet
-provide a reviewed clipboard mechanism or password generation.
+Stored passwords are available to the authenticated process during an
+operation and can be copied to the operating system clipboard after explicit
+confirmation. Clipboard contents are outside the encrypted vault and may
+remain accessible until the user clears them. There is no password generator
+or automatic clipboard expiry. The test backend is built separately and is
+not part of the production executable.
 
 The audit log intentionally has no account identifiers, tamper-evident chain,
 automatic rotation, or protection against modification by the same operating
@@ -329,8 +376,9 @@ authentication metadata.
 
 Sensitive buffers are cleared when released, but memory is not locked against
 swapping and cannot be protected from a privileged process. The encrypted
-vault format authenticates its contents but does not prevent deletion or
-rollback to an older valid vault.
+vault format authenticates its contents. The session snapshot detects changed
+plaintext within a session, but cannot prevent deletion or rollback across
+separate logins.
 
 `SIGKILL` and `SIGSTOP` cannot be caught, so the process cannot guarantee
 terminal restoration, explicit memory clearing, or lock-release cleanup after

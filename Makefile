@@ -26,7 +26,7 @@ DEP = $(OBJ:.o=.d) build/test_crypto.d build/test_auth.d build/test_storage.d \
 	build/test_audit.d build/test_access_control.d build/storage_test.d \
 	build/clipboard_test.d
 
-.PHONY: all clean test check-openssl
+.PHONY: all clean test test-snapshot check-openssl
 all: $(TARGET)
 
 $(TARGET): $(OBJ) | check-openssl
@@ -145,6 +145,9 @@ test: $(TARGET) build/securepm_test build/test_clipboard_sink build/test_crypto 
 	./build/test_vault
 	./build/test_credentials
 	./build/test_cli ./build/securepm_test
+
+test-snapshot: build/securepm_test build/test_clipboard_sink
+	python3 tests/test_session_snapshot.py
 
 clean:
 	rm -rf build
